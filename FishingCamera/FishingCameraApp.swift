@@ -7,6 +7,7 @@ import UIKit
 import MediaPlayer
 import Vision
 import CoreML
+import AVKit
 
 // MARK: - App 入口
 @main
@@ -598,22 +599,44 @@ protocol SpeechEngine: AnyObject {
 @available(iOS 26.0, *)
 final class ModernSpeechEngine: SpeechEngine {
     var onTextRecognized: ((String) -> Void)?
-    private var transcriber: SpeechTranscriber?
-    private var analyzer: SpeechAnalyzer?
+    private var recognizer: SFSpeechRecognizer?
+    private var audioEngine = AVAudioEngine()
+    private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
+    private var recognitionTask: SFSpeechRecognitionTask?
 
     func start(locale: Locale) async throws {
-        let transcriber = SpeechTranscriber(locale: locale, transcriptionOptions: [], reportingOptions: [], attributeOptions: [])
-        self.transcriber = transcriber
-        let analyzer = SpeechAnalyzer(modules: [transcriber])
-        self.analyzer = analyzer
-        Task { [weak self] in
-            for try await result in transcriber.results {
-                await MainActor.run { self?.onTextRecognized?(String(result.text.characters)) }
-            }
+        recognizer = SFSpeechRecognizer(locale: locale)
+        guard let recognizer = recognizer, recognizer.isAvailable else {
+            throw NSError(domain: "SpeechEngine", code: -1)
         }
-        try await analyzer.start()
+        let status = await withCheckedContinuation { continuation in
+            SFSpeechRecognizer.requestAuthorization { status in continuation.resume(returning: status) }
+        }
+        guard status == .authorized else { throw NSError(domain: "SpeechEngine", code: -2) }
+        let audioSession = AVAudioSession.sharedInstance()
+        try audioSession.setCategory(.record, mode: .measurement, options: .duckOthers)
+        try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
+        recognitionRequest = SFSpeechAudioBufferRecognitionRequest()
+        guard let request = recognitionRequest else { return }
+        request.shouldReportPartialResults = true
+        let inputNode = audioEngine.inputNode
+        let format = inputNode.outputFormat(forBus: 0)
+        inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in
+            self.recognitionRequest?.append(buffer)
+        }
+        audioEngine.prepare()
+        try audioEngine.start()
+        recognitionTask = recognizer.recognitionTask(with: request) { [weak self] result, _ in
+            guard let self, let result = result else { return }
+            DispatchQueue.main.async { self.onTextRecognized?(result.bestTranscription.formattedString) }
+        }
     }
-    func stop() { Task { try? await analyzer?.stop() } }
+    func stop() {
+        audioEngine.stop()
+        audioEngine.inputNode.removeTap(onBus: 0)
+        recognitionRequest?.endAudio()
+        recognitionTask?.cancel()
+    }
 }
 
 @available(iOS 10.0, *)
@@ -775,7 +798,10 @@ final class BatteryManager {
         timer = nil
         UIDevice.current.isBatteryMonitoringEnabled = false
     }
-    deinit { stop() }
+    deinit {
+        timer?.invalidate()
+        timer = nil
+    }
 }
 
 // MARK: - 声音反馈
