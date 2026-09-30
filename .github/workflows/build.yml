@@ -19,9 +19,6 @@ jobs:
         sudo xcode-select -s "$XCODE_PATH/Contents/Developer"
         xcodebuild -version
       
-    - name: List project info
-      run: xcodebuild -project FishingCamera.xcodeproj -list
-      
     - name: Build simulator
       run: |
         xcodebuild \
@@ -29,7 +26,6 @@ jobs:
           -target FishingCamera \
           -configuration Debug \
           -sdk iphonesimulator \
-          -derivedDataPath build \
           CODE_SIGN_IDENTITY="" \
           CODE_SIGNING_REQUIRED=NO \
           CODE_SIGNING_ALLOWED=NO \
@@ -42,20 +38,37 @@ jobs:
           -target FishingCamera \
           -configuration Debug \
           -sdk iphoneos \
-          -derivedDataPath build-device \
           CODE_SIGN_IDENTITY="" \
           CODE_SIGNING_REQUIRED=NO \
           CODE_SIGNING_ALLOWED=NO \
           build
           
+    - name: Find and upload simulator build
+      run: |
+        APP_PATH=$(find ~/Library/Developer/Xcode/DerivedData -name "FishingCamera.app" -path "*Debug-iphonesimulator*" | head -1)
+        echo "Simulator app: $APP_PATH"
+        if [ -n "$APP_PATH" ]; then
+          mkdir -p output/simulator
+          cp -R "$APP_PATH" output/simulator/
+        fi
+        
+    - name: Find and upload device build
+      run: |
+        APP_PATH=$(find ~/Library/Developer/Xcode/DerivedData -name "FishingCamera.app" -path "*Debug-iphoneos*" | head -1)
+        echo "Device app: $APP_PATH"
+        if [ -n "$APP_PATH" ]; then
+          mkdir -p output/device
+          cp -R "$APP_PATH" output/device/
+        fi
+        
     - name: Upload simulator build
       uses: actions/upload-artifact@v4
       with:
         name: FishingCamera-Simulator
-        path: build/Build/Products/Debug-iphonesimulator/FishingCamera.app
+        path: output/simulator/FishingCamera.app
         
     - name: Upload device build (unsigned)
       uses: actions/upload-artifact@v4
       with:
         name: FishingCamera-Device-Unsigned
-        path: build-device/Build/Products/Debug-iphoneos/FishingCamera.app
+        path: output/device/FishingCamera.app
