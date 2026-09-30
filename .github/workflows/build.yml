@@ -30,16 +30,17 @@ jobs:
           CODE_SIGNING_REQUIRED=NO \
           CODE_SIGNING_ALLOWED=NO \
           ONLY_ACTIVE_ARCH=NO \
+          ASSETCATALOG_COMPILER_GENERATE_ASSET_SYMBOLS=NO \
+          ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS=NO \
           build
           
-    - name: Find and upload device build
+    - name: Package IPA
       run: |
         APP_PATH=$(find . -name "FishingCamera.app" -path "*Debug-iphoneos*" | head -1)
         echo "Device app: $APP_PATH"
         if [ -n "$APP_PATH" ]; then
           mkdir -p output
           cp -R "$APP_PATH" output/
-          # 打包成 IPA 结构
           mkdir -p output/Payload
           cp -R "$APP_PATH" output/Payload/
           cd output
