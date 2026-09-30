@@ -12,9 +12,6 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     
-    - name: List available Xcode
-      run: ls /Applications/ | grep Xcode
-      
     - name: Select Xcode
       run: |
         XCODE_PATH=$(ls -d /Applications/Xcode*.app | head -1)
@@ -22,11 +19,14 @@ jobs:
         sudo xcode-select -s "$XCODE_PATH/Contents/Developer"
         xcodebuild -version
       
-    - name: Build (no signing)
+    - name: List project info
+      run: xcodebuild -project FishingCamera.xcodeproj -list
+      
+    - name: Build simulator
       run: |
         xcodebuild \
           -project FishingCamera.xcodeproj \
-          -scheme FishingCamera \
+          -target FishingCamera \
           -configuration Debug \
           -sdk iphonesimulator \
           -derivedDataPath build \
@@ -35,11 +35,11 @@ jobs:
           CODE_SIGNING_ALLOWED=NO \
           build
           
-    - name: Build for device (no signing)
+    - name: Build device
       run: |
         xcodebuild \
           -project FishingCamera.xcodeproj \
-          -scheme FishingCamera \
+          -target FishingCamera \
           -configuration Debug \
           -sdk iphoneos \
           -derivedDataPath build-device \
