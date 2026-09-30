@@ -1,0 +1,36 @@
+name: Build iOS App
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Select Xcode
+      run: sudo xcode-select -s /Applications/Xcode_15.4.app/Contents/Developer
+      
+    - name: Build (no signing)
+      run: |
+        xcodebuild           -project FishingCamera.xcodeproj           -scheme FishingCamera           -configuration Debug           -sdk iphonesimulator           -derivedDataPath build           CODE_SIGN_IDENTITY=""           CODE_SIGNING_REQUIRED=NO           CODE_SIGNING_ALLOWED=NO           build
+          
+    - name: Build for device (no signing)
+      run: |
+        xcodebuild           -project FishingCamera.xcodeproj           -scheme FishingCamera           -configuration Debug           -sdk iphoneos           -derivedDataPath build-device           CODE_SIGN_IDENTITY=""           CODE_SIGNING_REQUIRED=NO           CODE_SIGNING_ALLOWED=NO           build
+          
+    - name: Upload simulator build
+      uses: actions/upload-artifact@v4
+      with:
+        name: FishingCamera-Simulator
+        path: build/Build/Products/Debug-iphonesimulator/FishingCamera.app
+        
+    - name: Upload device build (unsigned)
+      uses: actions/upload-artifact@v4
+      with:
+        name: FishingCamera-Device-Unsigned
+        path: build-device/Build/Products/Debug-iphoneos/FishingCamera.app
