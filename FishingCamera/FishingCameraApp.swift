@@ -1,4 +1,4 @@
-import SwiftUI
+﻿import SwiftUI
 import AVFoundation
 import Photos
 import CoreMotion
@@ -150,15 +150,17 @@ final class H264VideoEncoder {
             VTCompressionSessionInvalidate(old)
             session = nil
         }
-        let spec: [String: Any] = [
-            kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder as String: true
-        ]
+        // 硬件加速 key 仅 iOS 17.4+；低版本传 nil 即可（系统默认优先硬件）
+        var spec: CFDictionary? = nil
+        if #available(iOS 17.4, *) {
+            spec = [kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder as String: true] as CFDictionary
+        }
         var newSession: VTCompressionSession?
         let status = VTCompressionSessionCreate(
             allocator: kCFAllocatorDefault,
             width: Int32(width), height: Int32(height),
             codecType: kCMVideoCodecType_H264,
-            encoderSpecification: spec as CFDictionary,
+            encoderSpecification: spec,
             imageBufferAttributes: nil,
             compressedDataAllocator: nil,
             outputCallback: { refcon, _, status, _, sampleBuffer in
@@ -166,17 +168,17 @@ final class H264VideoEncoder {
                 let encoder = Unmanaged<H264VideoEncoder>.fromOpaque(refcon).takeUnretainedValue()
                 encoder.onEncodedSample?(sb)
             },
-            outputCallbackRefCon: Unmanaged.passUnretained(self).toOpaque(),
+            refcon: Unmanaged.passUnretained(self).toOpaque(),
             compressionSessionOut: &newSession
         )
         guard status == noErr, let s = newSession else {
             print("[Encoder] 创建失败 \(status)"); return
         }
-        VTSessionSetProperty(s, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue)
-        VTSessionSetProperty(s, kVTCompressionPropertyKey_AverageBitRate, bitrate as CFNumber)
-        VTSessionSetProperty(s, kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_H264_High_AutoLevel)
-        VTSessionSetProperty(s, kVTCompressionPropertyKey_MaxKeyFrameInterval, (fps * 2) as CFNumber)
-        VTSessionSetProperty(s, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse)
+        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
+        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AverageBitRate, value: bitrate as CFNumber)
+        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_High_AutoLevel)
+        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: (fps * 2) as CFNumber)
+        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
         VTCompressionSessionPrepareToEncodeFrames(s)
         self.session = s
         print("[Encoder] H.264 就绪 \(width)x\(height) @\(fps)")
@@ -193,7 +195,7 @@ final class H264VideoEncoder {
             session, imageBuffer: pixelBuffer,
             presentationTimeStamp: presentationTime, duration: .invalid,
             frameProperties: props.isEmpty ? nil : props as CFDictionary,
-            sourceFrameRefCon: nil, infoFlagsOut: nil
+            sourceFrameRefcon: nil, infoFlagsOut: nil
         )
     }
 
@@ -539,7 +541,7 @@ extension CameraEngine: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureA
             let shouldForceKey = isRecordingInternal && (compressedVideoBuffer?.count ?? 0) == 0
             encoder.encode(pixelBuffer: pixelBuffer, presentationTime: pts, forceKeyframe: shouldForceKey)
         } else if output === audioOutput {
-            if preRecordOnInternal, let buf = audioBuffer { buf.write(sampleBuffer) }
+            if preRecordOnInternal, var buf = audioBuffer { buf.write(sampleBuffer) }
             if isRecordingInternal { writer.appendAudio(sampleBuffer) }
             voiceManager.feedAudio(sampleBuffer)
         }
@@ -770,10 +772,22 @@ private struct VolumeBtn: UIViewRepresentable {
     let action: () -> Void
     func makeUIView(context: Context) -> UIView {
         let v = UIView(); v.isUserInteractionEnabled = false
-        let i = AVCaptureEventInteraction { e in
-            if e.phase == .ended { DispatchQueue.main.async { action() } }
+        // 动态创建 AVCaptureEventInteraction，避免编译时符号依赖
+        if let cls = NSClassFromString("AVCaptureEventInteraction") as? NSObject.Type {
+            let sel = NSSelectorFromString("initWithHandler:")
+            if cls.responds(to: sel) {
+                let handler: @convention(block) (AnyObject) -> Void = { e in
+                    if let phase = e.value(forKey: "phase") as? Int, phase == 2 { // .ended
+                        DispatchQueue.main.async { action() }
+                    }
+                }
+                let interaction = cls.perform(sel, with: handler)?.takeUnretainedValue()
+                if let interaction = interaction as? UIInteraction {
+                    v.addInteraction(interaction)
+                }
+            }
         }
-        v.addInteraction(i); return v
+        return v
     }
     func updateUIView(_ uiView: UIView, context: Context) {}
 }
@@ -832,7 +846,7 @@ struct CameraScreen: View {
                              color: engine.batteryLevel < 0.2 ? .red : .white)
                         Button { showSettings = true } label: {
                             Image(systemName: "gearshape.fill")
-                                .foregroundStyle(.white).padding(8)
+                                .foregroundColor(.white).padding(8)
                                 .background(Color.black.opacity(0.5)).clipShape(Circle())
                         }
                     }.padding(.horizontal, 16).padding(.top, 8)
@@ -852,7 +866,7 @@ struct CameraScreen: View {
                         } label: {
                             Text(engine.currentLens.rawValue)
                                 .font(.system(size: 14, weight: .bold))
-                                .foregroundStyle(.white).frame(width: 64, height: 44)
+                                .foregroundColor(.white).frame(width: 64, height: 44)
                                 .background(Color.black.opacity(0.6)).cornerRadius(8)
                         }
                         Button {
@@ -870,14 +884,14 @@ struct CameraScreen: View {
                         Button { engine.toggleVoice() } label: {
                             Image(systemName: engine.voiceEnabled ? "mic.fill" : "mic.slash.fill")
                                 .font(.system(size: 16))
-                                .foregroundStyle(engine.voiceEnabled ? .green : .white)
+                                .foregroundColor(engine.voiceEnabled ? .green : .white)
                                 .frame(width: 44, height: 44)
                                 .background(Color.black.opacity(0.6)).clipShape(Circle())
                         }
                         Button { engine.toggleScreenOffMode() } label: {
                             Image(systemName: engine.isScreenOffMode ? "moon.fill" : "moon")
                                 .font(.system(size: 16))
-                                .foregroundStyle(.white)
+                                .foregroundColor(.white)
                                 .frame(width: 44, height: 44)
                                 .background(Color.black.opacity(0.6)).clipShape(Circle())
                         }
@@ -889,7 +903,7 @@ struct CameraScreen: View {
                 VStack {
                     Spacer()
                     Text(msg).padding(.horizontal, 16).padding(.vertical, 8)
-                        .background(Color.black.opacity(0.7)).foregroundStyle(.white)
+                        .background(Color.black.opacity(0.7)).foregroundColor(.white)
                         .cornerRadius(20).padding(.bottom, 120)
                 }
             }
@@ -908,7 +922,7 @@ struct Pill: View {
     var body: some View {
         Text(text)
             .font(.system(size: 12, weight: .bold, design: .monospaced))
-            .foregroundStyle(color).padding(.horizontal, 10).padding(.vertical, 5)
+            .foregroundColor(color).padding(.horizontal, 10).padding(.vertical, 5)
             .background(Color.black.opacity(0.5)).clipShape(Capsule())
     }
 }
@@ -939,12 +953,12 @@ struct SettingsView: View {
                     }
                     HStack {
                         Text("自动预录（结束后自动开始下一个）")
-                            .font(.system(size: 14)).foregroundStyle(.white)
+                            .font(.system(size: 14)).foregroundColor(.white)
                         Spacer()
                         Toggle("", isOn: Binding(
                             get: { engine.isAutoPreRecordEnabled },
                             set: { _ in engine.toggleAutoPreRecord() }
-                        )).tint(.green)
+                        )).accentColor(.green)
                     }.padding(.horizontal, 4)
 
                     group("切换镜头") {
@@ -977,15 +991,15 @@ struct SettingsView: View {
                         }
                     }
                     VStack(alignment: .leading, spacing: 8) {
-                        Text("自定义语音指令").font(.system(size: 14, weight: .bold)).foregroundStyle(.gray)
+                        Text("自定义语音指令").font(.system(size: 14, weight: .bold)).foregroundColor(.gray)
                         TextField("开始词（逗号分隔）", text: Binding(
                             get: { engine.customStartWords.joined(separator: ",") },
                             set: { engine.customStartWords = $0.split(separator: ",").map(String.init).filter { !$0.isEmpty } }
-                        )).textFieldStyle(RoundedBorderTextFieldStyle()).foregroundStyle(.white)
+                        )).textFieldStyle(RoundedBorderTextFieldStyle()).foregroundColor(.white)
                         TextField("结束词（逗号分隔）", text: Binding(
                             get: { engine.customStopWords.joined(separator: ",") },
                             set: { engine.customStopWords = $0.split(separator: ",").map(String.init).filter { !$0.isEmpty } }
-                        )).textFieldStyle(RoundedBorderTextFieldStyle()).foregroundStyle(.white)
+                        )).textFieldStyle(RoundedBorderTextFieldStyle()).foregroundColor(.white)
                     }.padding(.top, 8)
                 }.padding()
             }
@@ -994,7 +1008,7 @@ struct SettingsView: View {
             .toolbar {
                 ToolbarItem(placement: .navigationBarLeading) {
                     Button { dismiss.wrappedValue.dismiss() } label: {
-                        Image(systemName: "chevron.left").foregroundStyle(.white)
+                        Image(systemName: "chevron.left").foregroundColor(.white)
                     }
                 }
             }
@@ -1004,7 +1018,7 @@ struct SettingsView: View {
     @ViewBuilder
     private func group<C: View>(_ t: String, @ViewBuilder content: () -> C) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text(t).font(.system(size: 14, weight: .bold)).foregroundStyle(.gray)
+            Text(t).font(.system(size: 14, weight: .bold)).foregroundColor(.gray)
             LazyVGrid(columns: cols, spacing: 10) { content() }
         }
     }
@@ -1018,7 +1032,7 @@ struct Cell: View {
         Button(action: action) {
             Text(title)
                 .font(.system(size: 14, weight: selected ? .bold : .regular))
-                .foregroundStyle(enabled ? .white : .gray)
+                .foregroundColor(enabled ? .white : .gray)
                 .frame(maxWidth: .infinity).frame(height: 44)
                 .background(Color(white: 0.2)).cornerRadius(6)
                 .overlay(RoundedRectangle(cornerRadius: 6)
