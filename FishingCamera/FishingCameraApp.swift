@@ -543,7 +543,6 @@ final class CameraEngine: NSObject, ObservableObject {
             self.currentVideoDevice = d
             self.applyAllConnectionSettings()
             self.captureSession.commitConfiguration()
-            self.encoderWidth = 0; self.encoderHeight = 0 // 强制 captureOutput 重建编码器
             DispatchQueue.main.async { self.currentLens = lens }
         }
     }
@@ -560,7 +559,6 @@ final class CameraEngine: NSObject, ObservableObject {
                 self.captureSession.sessionPreset = r.sessionPreset
             }
             self.captureSession.commitConfiguration()
-            self.encoderWidth = 0; self.encoderHeight = 0
             self.rebuildBuffers()
             self.applyFrameRate()
         }
@@ -571,7 +569,6 @@ final class CameraEngine: NSObject, ObservableObject {
         DispatchQueue.main.async { self.frameRate = f }
         sessionQueue.async { [weak self] in
             guard let self = self else { return }
-            self.encoderWidth = 0; self.encoderHeight = 0
             self.applyFrameRate(); self.rebuildBuffers()
         }
     }
