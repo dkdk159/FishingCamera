@@ -5,6 +5,7 @@ import UIKit
 import VideoToolbox
 import AudioToolbox
 import Speech
+import CoreMedia
 
 // MARK: - App 入口
 @main
@@ -16,430 +17,324 @@ struct ActionCameraApp: App {
     }
 }
 
-// MARK: - 枚举定义（匹配主流运动相机设置）
+// MARK: - 枚举
 enum CameraLens: String, CaseIterable {
     case ultraWide = "超广角"
     case wide      = "广角"
     case telephoto = "长焦"
-    case frontWide = "前置广角"
+    case frontWide = "前置"
 
-    var deviceType: AVCaptureDevice.DeviceType {
-        switch self {
-        case .ultraWide: return .builtInUltraWideCamera
-        case .wide, .frontWide: return .builtInWideAngleCamera
-        case .telephoto: return .builtInTelephotoCamera
-        }
-    }
-
-    var position: AVCaptureDevice.Position {
-        self == .frontWide ? .front : .back
-    }
-
+    var position: AVCaptureDevice.Position { self == .frontWide ? .front : .back }
     var shortName: String {
         switch self {
         case .ultraWide: return "0.5×"
         case .wide: return "1×"
-        case .telephoto: return "3×"
+        case .telephoto: return "长焦"
         case .frontWide: return "前置"
         }
     }
 }
 
 enum StabilizationLevel: String, CaseIterable {
-    case off       = "关"
-    case standard  = "标准"
-    case smooth    = "平滑"
-    case enhanced  = "增强"
-    case superMode = "超强"
-    case auto      = "自动"
-}
-
-enum PreRecordOption: String, CaseIterable {
-    case off = "关"
-    case s5  = "5秒"
-    case s15 = "15秒"
-    case s30 = "30秒"
-    case m1  = "1分钟"
-    case m2  = "2分钟"
-
-    var seconds: TimeInterval {
+    case off = "关", standard = "标准", smooth = "平滑", enhanced = "增强", auto = "自动"
+    var mode: AVCaptureVideoStabilizationMode {
         switch self {
-        case .off: return 0
-        case .s5: return 5
-        case .s15: return 15
-        case .s30: return 30
-        case .m1: return 60
-        case .m2: return 120
+        case .off: return .off
+        case .standard: return .standard
+        case .smooth: return .cinematic
+        case .enhanced: return .cinematicExtended
+        case .auto: return .auto
         }
     }
 }
 
-enum VideoResolution: String, CaseIterable {
-    case uhd4K       = "4K"
-    case uhd4K4x3    = "4K (4:3)"
-    case k3          = "3K (4:3)"
-    case k2_5        = "2.5K (4:3)"
-    case k2          = "2K (4:3)"
-    case hd1080      = "1080p"
-    case hd1080_4x3  = "1080p (4:3)"
-    case hd720       = "720p"
+enum PreRecordOption: Int, CaseIterable {
+    case off = 0, s5 = 5, s15 = 15, s30 = 30, s60 = 60, s120 = 120
+    var label: String { rawValue == 0 ? "关" : "\(rawValue)秒" }
+    var seconds: TimeInterval { Double(rawValue) }
+}
 
-    var sessionPreset: AVCaptureSession.Preset {
+/// 真实可用的分辨率档位（activeFormat 匹配）
+enum QualityOption: String, CaseIterable {
+    case uhd4K169   = "4K 16:9"
+    case uhd4K43    = "4K 4:3"
+    case hd1080169  = "1080P 16:9"
+    case hd108043   = "1080P 4:3"
+    case hd720169   = "720P 16:9"
+    case hd72043    = "720P 4:3"
+
+    var targetWidth: Int32 {
         switch self {
-        case .uhd4K, .uhd4K4x3, .k3, .k2_5: return .hd4K3840x2160
-        case .k2, .hd1080, .hd1080_4x3: return .hd1920x1080
-        case .hd720: return .hd1280x720
+        case .uhd4K169, .uhd4K43: return 3840
+        case .hd1080169, .hd108043: return 1920
+        case .hd720169, .hd72043: return 1280
         }
     }
-
-    var encodedSize: (width: Int, height: Int, bitrate: Int) {
-        switch sessionPreset {
-        case .hd4K3840x2160: return (3840, 2160, 32_000_000)
-        case .hd1280x720:   return (1280, 720, 5_000_000)
-        default:            return (1920, 1080, 9_000_000)
+    var targetHeight: Int32 {
+        switch self {
+        case .uhd4K169: return 2160
+        case .uhd4K43: return 2880
+        case .hd1080169: return 1080
+        case .hd108043: return 1440
+        case .hd720169: return 720
+        case .hd72043: return 960
         }
     }
+    var is43: Bool { self == .uhd4K43 || self == .hd108043 || self == .hd72043 }
 }
 
 enum FrameRateOption: Int, CaseIterable {
-    case fps24 = 24
-    case fps25 = 25
-    case fps30 = 30
-    case fps48 = 48
-    case fps50 = 50
-    case fps60 = 60
-    case fps120 = 120
-    case fps240 = 240
-
-    var displayName: String { "\(rawValue)fps" }
+    case auto = 0, f30 = 30, f60 = 60, f120 = 120, f240 = 240
+    var label: String { rawValue == 0 ? "自动" : "\(rawValue)" }
 }
 
-// MARK: - 时间滚动环形缓冲（线程安全，按 PTS 自动淘汰过期帧）
-private struct TimedSample {
-    let buffer: CMSampleBuffer
-    let pts: CMTime
-}
+// MARK: - 环形缓冲（线程安全，PTS 滚动淘汰）
+private struct TimedSample { let buffer: CMSampleBuffer; let pts: CMTime }
 
 final class SampleRingBuffer {
     private var items: [TimedSample] = []
     private let lock = NSLock()
     private let maxSeconds: Double
-
     init(maxSeconds: Double) { self.maxSeconds = max(1, maxSeconds) }
-
     func append(_ sb: CMSampleBuffer) {
         let pts = CMSampleBufferGetPresentationTimeStamp(sb)
         guard pts.isValid else { return }
-        lock.lock()
-        items.append(TimedSample(buffer: sb, pts: pts))
+        lock.lock(); defer { lock.unlock() }
+        items.append(.init(buffer: sb, pts: pts))
         let cutoff = pts.seconds - maxSeconds
-        while let first = items.first, first.pts.seconds <= cutoff {
-            items.removeFirst()
-        }
-        lock.unlock()
+        while let f = items.first, f.pts.seconds <= cutoff { items.removeFirst() }
     }
-
     func snapshot() -> [CMSampleBuffer] {
-        lock.lock()
-        defer { lock.unlock() }
+        lock.lock(); defer { lock.unlock() }
         return items.map { $0.buffer }
     }
 }
 
-// MARK: - VideoToolbox 硬件 H264 压缩器
-// 预录必须缓存“压缩后”的帧：未压缩帧每帧约 8MB，缓存几十秒会耗尽采集像素池导致黑屏。
-final class VideoCompressor: NSObject {
+private func isKeyFrame(_ sb: CMSampleBuffer) -> Bool {
+    guard let arr = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: false)
+        as? [[CFString: Any]], let a = arr.first else { return true }
+    return !(a[kCMSampleAttachmentKey_NotSync] as? Bool ?? false)
+}
+
+// MARK: - H264 硬件编码器
+final class VideoCompressor {
     private var session: VTCompressionSession?
     private(set) var formatDescription: CMFormatDescription?
     var onEncoded: ((CMSampleBuffer) -> Void)?
+    private(set) var width: Int32 = 1920
+    private(set) var height: Int32 = 1080
 
-    func configure(width: Int, height: Int, fps: Int32, bitRate: Int) {
+    func configure(width: Int32, height: Int32, fps: Int32, bitRate: Int) {
         invalidate()
+        self.width = width; self.height = height
         var s: VTCompressionSession?
-        let status = VTCompressionSessionCreate(
-            allocator: kCFAllocatorDefault,
-            width: Int32(width),
-            height: Int32(height),
+        let st = VTCompressionSessionCreate(allocator: kCFAllocatorDefault,
+            width: width, height: height,
             codecType: kCMVideoCodecType_H264,
-            encoderSpecification: nil,
-            imageBufferAttributes: nil,
-            compressedDataAllocator: nil,
-            outputCallback: nil,
-            refcon: nil,
+            encoderSpecification: nil, imageBufferAttributes: nil,
+            compressedDataAllocator: nil, outputCallback: nil, refcon: nil,
             compressionSessionOut: &s)
-        guard status == noErr, let session = s else {
-            print("[Compressor] create failed \(status)")
-            return
-        }
+        guard st == noErr, let session = s else { print("[ENC] create fail \(st)"); return }
         self.session = session
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ProfileLevel,
-                            value: kVTProfileLevel_H264_High_AutoLevel)
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate,
-                            value: bitRate as CFNumber)
-        // 每秒一个关键帧：预录从缓冲中段开始写入时，最多丢失开头1秒画面，保证整段可解码
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval,
-                            value: max(fps, 1) as CFNumber)
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AllowFrameReordering,
-                            value: kCFBooleanFalse)
+                             value: kVTProfileLevel_H264_High_AutoLevel)
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: bitRate as CFNumber)
+        // 每秒 2 个关键帧，预录从任意点开始最多丢 0.5 秒
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: max(fps / 2, 1) as CFNumber)
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
         VTCompressionSessionPrepareToEncodeFrames(session)
+        print("[ENC] configured \(width)x\(height)@\(fps)")
     }
 
-    func encode(_ sampleBuffer: CMSampleBuffer) {
-        guard let session = session,
-              let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-        var duration = CMSampleBufferGetDuration(sampleBuffer)
-        if !duration.isValid { duration = CMTime(value: 1, timescale: 30) }
-
-        VTCompressionSessionEncodeFrame(
-            session,
-            imageBuffer: pixelBuffer,
-            presentationTimeStamp: pts,
-            duration: duration,
-            frameProperties: nil,
-            infoFlagsOut: nil
-        ) { [weak self] status, _, encoded in
-            guard status == noErr, let encoded = encoded else { return }
-            if self?.formatDescription == nil {
-                self?.formatDescription = CMSampleBufferGetFormatDescription(encoded)
-            }
-            self?.onEncoded?(encoded)
+    func encode(_ sb: CMSampleBuffer) {
+        guard let session = session, let pb = CMSampleBufferGetImageBuffer(sb) else { return }
+        var dur = CMSampleBufferGetDuration(sb)
+        if !dur.isValid { dur = CMTime(value: 1, timescale: 30) }
+        VTCompressionSessionEncodeFrame(session, imageBuffer: pb,
+            presentationTimeStamp: CMSampleBufferGetPresentationTimeStamp(sb),
+            duration: dur, frameProperties: nil, infoFlagsOut: nil) { [weak self] st, _, enc in
+            guard st == noErr, let enc = enc else { return }
+            if self?.formatDescription == nil { self?.formatDescription = CMSampleBufferGetFormatDescription(enc) }
+            self?.onEncoded?(enc)
         }
     }
 
     func invalidate() {
-        if let session = session {
-            VTCompressionSessionCompleteFrames(session, untilPresentationTimeStamp: .invalid)
-            VTCompressionSessionInvalidate(session)
-        }
-        session = nil
-        formatDescription = nil
+        guard let session = session else { return }
+        VTCompressionSessionCompleteFrames(session, untilPresentationTimeStamp: .invalid)
+        VTCompressionSessionInvalidate(session)
+        self.session = nil; formatDescription = nil
     }
 }
 
-// MARK: - 判断是否关键帧
-private func sampleIsKeyFrame(_ sb: CMSampleBuffer) -> Bool {
-    guard let attachments = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: false)
-        as? [[CFString: Any]], let attach = attachments.first else { return true }
-    return !(attach[kCMSampleAttachmentKey_NotSync] as? Bool ?? false)
-}
+// MARK: - 录制写入器（全部在 sessionQueue 同步调用，无竞争）
+final class Recorder {
+    private var writer: AVAssetWriter?
+    private var vIn: AVAssetWriterInput?
+    private var aIn: AVAssetWriterInput?
+    private var finishing = false
 
-// MARK: - 预录写入器（H264 直通 + PCM→AAC，串行队列保证线程安全）
-final class PreRecordWriter {
-    private var assetWriter: AVAssetWriter?
-    private var videoInput: AVAssetWriterInput?
-    private var audioInput: AVAssetWriterInput?
-    private let queue = DispatchQueue(label: "com.actioncam.writer")
-    private var active = false
-    private var didStartSession = false
+    var isActive: Bool { writer != nil && !finishing }
 
-    func begin(videoFrames: [CMSampleBuffer],
-               audioFrames: [CMSampleBuffer],
-               url: URL,
-               videoFormat: CMFormatDescription?) {
-        queue.async { [weak self] in
-            guard let self = self else { return }
-            do {
-                if FileManager.default.fileExists(atPath: url.path) {
-                    try? FileManager.default.removeItem(at: url)
-                }
-                let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
-
-                let vInput: AVAssetWriterInput
-                if let fmt = videoFormat {
-                    vInput = AVAssetWriterInput(mediaType: .video, outputSettings: nil,
-                                               sourceFormatHint: fmt)
-                } else {
-                    vInput = AVAssetWriterInput(mediaType: .video, outputSettings: [
-                        AVVideoCodecKey: AVVideoCodecType.h264,
-                        AVVideoWidthKey: 1920,
-                        AVVideoHeightKey: 1080
-                    ])
-                }
-                vInput.expectsMediaDataInRealTime = true
-                // 竖屏方向：直接写入轨道变换，无需后期二次导出
-                vInput.transform = CGAffineTransform(rotationAngle: .pi / 2)
-                if writer.canAdd(vInput) { writer.add(vInput) }
-
-                let aInput = AVAssetWriterInput(mediaType: .audio, outputSettings: [
-                    AVFormatIDKey: kAudioFormatMPEG4AAC,
-                    AVNumberOfChannelsKey: 1,
-                    AVSampleRateKey: 44100,
-                    AVEncoderBitRateKey: 128000
-                ])
-                aInput.expectsMediaDataInRealTime = true
-                if writer.canAdd(aInput) { writer.add(aInput) }
-
-                writer.startWriting()
-
-                // 关键：预录历史必须从第一个关键帧开始，否则开头到下个I帧之间无法解码
-                var trimmedVideo = videoFrames
-                if let ki = trimmedVideo.firstIndex(where: { sampleIsKeyFrame($0) }) {
-                    trimmedVideo = Array(trimmedVideo[ki...])
-                } else {
-                    trimmedVideo = []
-                }
-
-                // 音频裁到视频起点，避免负 PTS
-                var trimmedAudio = audioFrames
-                if let vStart = trimmedVideo.first?.presentationTimeStamp {
-                    trimmedAudio = audioFrames.filter {
-                        $0.presentationTimeStamp.seconds >= vStart.seconds - 0.001
-                    }
-                    writer.startSession(atSourceTime: vStart)
-                    self.didStartSession = true
-
-                    // 按时间戳交错写入音视频历史帧，忙等待防丢帧
-                    var vi = 0, ai = 0
-                    while vi < trimmedVideo.count || ai < trimmedAudio.count {
-                        if ai >= trimmedAudio.count ||
-                            (vi < trimmedVideo.count &&
-                             trimmedVideo[vi].presentationTimeStamp.seconds <= trimmedAudio[ai].presentationTimeStamp.seconds) {
-                            var waited = 0
-                            while !vInput.isReadyForMoreMediaData && waited < 50 {
-                                usleep(2000); waited += 1
-                            }
-                            if vInput.isReadyForMoreMediaData { vInput.append(trimmedVideo[vi]) }
-                            vi += 1
-                        } else {
-                            var waited = 0
-                            while !aInput.isReadyForMoreMediaData && waited < 50 {
-                                usleep(2000); waited += 1
-                            }
-                            if aInput.isReadyForMoreMediaData { aInput.append(trimmedAudio[ai]) }
-                            ai += 1
-                        }
-                    }
-                }
-
-                self.assetWriter = writer
-                self.videoInput = vInput
-                self.audioInput = aInput
-                self.active = true
-                print("[Writer] begin ok, history video=\(trimmedVideo.count) audio=\(trimmedAudio.count)")
-            } catch {
-                print("[Writer] begin failed: \(error)")
-                self.active = false
-            }
+    /// 同步开始并写入历史帧。返回是否成功。
+    @discardableResult
+    func begin(video: [CMSampleBuffer], audio: [CMSampleBuffer],
+               url: URL, format: CMFormatDescription?, portrait: Bool) -> Bool {
+        guard let format = format else {
+            print("[REC] encoder format not ready")
+            return false
         }
+        do {
+            if FileManager.default.fileExists(atPath: url.path) { try? FileManager.default.removeItem(at: url) }
+            let w = try AVAssetWriter(outputURL: url, fileType: .mp4)
+
+            // passthrough：直接写入已由 VideoToolbox 编码的 H264 帧
+            let vi = AVAssetWriterInput(mediaType: .video, outputSettings: nil, sourceFormatHint: format)
+            vi.expectsMediaDataInRealTime = true
+            if portrait { vi.transform = CGAffineTransform(rotationAngle: .pi / 2) }
+            if w.canAdd(vi) { w.add(vi) }
+
+            let ai = AVAssetWriterInput(mediaType: .audio, outputSettings: [
+                AVFormatIDKey: kAudioFormatMPEG4AAC,
+                AVNumberOfChannelsKey: 1,
+                AVSampleRateKey: 44100,
+                AVEncoderBitRateKey: 128000])
+            ai.expectsMediaDataInRealTime = true
+            if w.canAdd(ai) { w.add(ai) }
+
+            w.startWriting()
+
+            // 历史视频必须从关键帧开始
+            var v = video
+            if let ki = v.firstIndex(where: { isKeyFrame($0) }) { v = Array(v[ki...]) } else { v = [] }
+            guard let start = v.first?.pts ?? audio.first?.pts else {
+                // 完全没有历史：先启动，实时帧再开始 session
+                writer = w; vIn = vi; aIn = ai
+                print("[REC] begin no-history")
+                return true
+            }
+            var a = audio.filter { $0.pts.seconds >= start.seconds - 0.002 }
+            w.startSession(atSourceTime: start)
+
+            // 交错写入历史（等待输入就绪，避免丢历史帧）
+            var vi2 = 0, ai2 = 0
+            while vi2 < v.count || ai2 < a.count {
+                if ai2 >= a.count || (vi2 < v.count && v[vi2].pts.seconds <= a[ai2].pts.seconds) {
+                    if Self.waitReady(vi) { vi.append(v[vi2]) }
+                    vi2 += 1
+                } else {
+                    if Self.waitReady(ai) { ai.append(a[ai2]) }
+                    ai2 += 1
+                }
+            }
+            writer = w; vIn = vi; aIn = ai
+            print("[REC] begin history v=\(v.count) a=\(a.count)")
+            return true
+        } catch {
+            print("[REC] begin error: \(error)")
+            return false
+        }
+    }
+
+    /// 短暂等待 writer 输入就绪（最多 ~0.5s），返回是否可写入
+    private static func waitReady(_ input: AVAssetWriterInput) -> Bool {
+        var n = 0
+        while !input.isReadyForMoreMediaData, n < 50 {
+            usleep(10_000); n += 1
+            if Thread.isCancelled { return false }
+        }
+        return input.isReadyForMoreMediaData
     }
 
     func appendVideo(_ sb: CMSampleBuffer) {
-        queue.async { [weak self] in
-            guard let self = self, self.active, let writer = self.assetWriter else { return }
-            if !self.didStartSession {
-                // 无历史帧时，必须从关键帧开始
-                guard sampleIsKeyFrame(sb) else { return }
-                writer.startSession(atSourceTime: sb.presentationTimeStamp)
-                self.didStartSession = true
-            }
-            if self.videoInput?.isReadyForMoreMediaData == true {
-                self.videoInput?.append(sb)
-            }
+        guard let w = writer, !finishing else { return }
+        if w.status != .writing { return }
+        if w.sessionStartTime.isNaN {
+            // session 尚未开始（无历史帧情形）：必须从关键帧开始
+            guard isKeyFrame(sb) else { return }
+            w.startSession(atSourceTime: sb.pts)
         }
+        if vIn?.isReadyForMoreMediaData == true { vIn?.append(sb) }
     }
 
     func appendAudio(_ sb: CMSampleBuffer) {
-        queue.async { [weak self] in
-            guard let self = self, self.active, let writer = self.assetWriter else { return }
-            if !self.didStartSession {
-                writer.startSession(atSourceTime: sb.presentationTimeStamp)
-                self.didStartSession = true
-            }
-            if self.audioInput?.isReadyForMoreMediaData == true {
-                self.audioInput?.append(sb)
-            }
-        }
+        guard let w = writer, !finishing else { return }
+        if w.status != .writing { return }
+        if w.sessionStartTime.isNaN { w.startSession(atSourceTime: sb.pts) }
+        if aIn?.isReadyForMoreMediaData == true { aIn?.append(sb) }
     }
 
-    func finish(completion: @escaping (URL?) -> Void) {
-        queue.async { [weak self] in
-            guard let self = self, self.active, let writer = self.assetWriter else {
-                completion(nil)
-                return
-            }
-            self.active = false
-            self.videoInput?.markAsFinished()
-            self.audioInput?.markAsFinished()
-            writer.finishWriting {
-                if writer.status == .completed {
-                    completion(writer.outputURL)
-                } else {
-                    print("[Writer] finish failed: \(String(describing: writer.error))")
-                    completion(nil)
-                }
+    func finish(_ done: @escaping (URL?) -> Void) {
+        guard let w = writer, !finishing else { done(nil); return }
+        finishing = true
+        vIn?.markAsFinished(); aIn?.markAsFinished()
+        w.finishWriting { [weak self] in
+            let url = w.status == .completed ? w.outputURL : nil
+            if let e = w.error { print("[REC] finish error: \(e)") }
+            DispatchQueue.main.async {
+                self?.writer = nil; self?.vIn = nil; self?.aIn = nil; self?.finishing = false
+                done(url)
             }
         }
     }
 }
 
 private extension CMSampleBuffer {
-    var presentationTimeStamp: CMTime { CMSampleBufferGetPresentationTimeStamp(self) }
+    var pts: CMTime { CMSampleBufferGetPresentationTimeStamp(self) }
 }
 
-// MARK: - 相册保存
-enum PhotoLibrarySaver {
-    static func save(_ url: URL, completion: @escaping (Bool) -> Void) {
-        PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
-            guard status == .authorized || status == .limited else {
-                DispatchQueue.main.async { completion(false) }
-                return
+// MARK: - 相册
+enum PhotoSaver {
+    static func save(_ url: URL, _ done: @escaping (Bool) -> Void) {
+        PHPhotoLibrary.requestAuthorization(for: .addOnly) { st in
+            guard st == .authorized || st == .limited else {
+                DispatchQueue.main.async { done(false) }; return
             }
-            PHPhotoLibrary.shared().performChanges({
+            PHPhotoLibrary.shared().performChanges {
                 PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: url)
-            }, completionHandler: { ok, err in
-                if let err = err { print("[Photo] save error: \(err)") }
-                DispatchQueue.main.async { completion(ok) }
-            })
+            } completionHandler: { ok, e in
+                if let e = e { print("[Photo] \(e)") }
+                DispatchQueue.main.async { done(ok) }
+            }
         }
     }
 }
 
-// MARK: - 离线中文语音控制器
-// 直接复用相机采集的 PCM 音频帧，不额外占用麦克风。
-final class VoiceController: NSObject {
+// MARK: - 语音控制（相机流 → AVAudioConverter → SFSpeech）
+final class VoiceController {
     static let shared = VoiceController()
-
     private let queue = DispatchQueue(label: "com.actioncam.voice")
     private var recognizer: SFSpeechRecognizer?
     private var request: SFSpeechAudioBufferRecognitionRequest?
     private var task: SFSpeechRecognitionTask?
-    private var active = false
-    private var lastCommandAt = Date.distantPast
-    private var lastCommand = ""
+    private var running = false
+    private var converter: AVAudioConverter?
+    private var converterFormat: AVAudioFormat?
+    private let targetFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000,
+                                             channels: 1, interleaved: false)!
+    private var lastCmd = ""
+    private var lastCmdAt = Date.distantPast
 
-    /// 识别到命令回调："start" / "stop"（主线程）
     var onCommand: ((String) -> Void)?
-    var onListeningChange: ((Bool) -> Void)?
+    var onState: ((Bool) -> Void)?
 
-    private override init() {
-        super.init()
-        recognizer = SFSpeechRecognizer(locale: Locale(identifier: "zh-CN"))
-    }
+    init() { recognizer = SFSpeechRecognizer(locale: Locale(identifier: "zh-CN")) }
 
-    var isListening: Bool {
-        queue.sync { active }
-    }
-
-    /// 开启语音监听（含权限请求）
-    func start(completion: @escaping (Bool, String) -> Void) {
-        SFSpeechRecognizer.requestAuthorization { [weak self] status in
+    func start(_ done: @escaping (Bool, String) -> Void) {
+        SFSpeechRecognizer.requestAuthorization { [weak self] st in
             guard let self = self else { return }
-            guard status == .authorized else {
-                DispatchQueue.main.async { completion(false, "语音识别未授权") }
-                return
+            guard st == .authorized else {
+                DispatchQueue.main.async { done(false, "请在设置中允许语音识别") }; return
             }
             self.queue.async {
-                guard let recognizer = self.recognizer, recognizer.isAvailable else {
-                    DispatchQueue.main.async { completion(false, "语音识别不可用") }
-                    return
+                guard let r = self.recognizer, r.isAvailable else {
+                    DispatchQueue.main.async { done(false, "语音识别不可用") }; return
                 }
-                self.active = true
-                self.startRecognitionLocked()
+                self.running = true
+                self.startTask()
                 DispatchQueue.main.async {
-                    self.onListeningChange?(true)
-                    completion(true, "语音已开启")
+                    self.onState?(true); done(true, "语音已开启：说开始录像 / 停止录像")
                 }
             }
         }
@@ -447,902 +342,874 @@ final class VoiceController: NSObject {
 
     func stop() {
         queue.async { [weak self] in
-            guard let self = self, self.active else { return }
-            self.active = false
-            self.request?.endAudio()
-            self.task?.cancel()
-            self.request = nil
-            self.task = nil
-            DispatchQueue.main.async { self.onListeningChange?(false) }
+            guard let self = self, self.running else { return }
+            self.running = false
+            self.request?.endAudio(); self.task?.cancel()
+            self.request = nil; self.task = nil
+            DispatchQueue.main.async { self.onState?(false) }
         }
     }
 
-    private func startRecognitionLocked() {
-        guard active, let recognizer = recognizer else { return }
-        task?.cancel()
-        task = nil
+    private func startTask() {
+        guard running, let r = recognizer else { return }
+        task?.cancel(); task = nil
         let req = SFSpeechAudioBufferRecognitionRequest()
-        // 优先离线识别；设备不支持离线时走在线
-        if recognizer.supportsOnDeviceRecognition {
-            req.requiresOnDeviceRecognition = true
-        }
         req.shouldReportPartialResults = true
-        if #available(iOS 16, *) {
-            req.addsPunctuation = false
-        }
+        // 不强制离线：中文离线仅部分机型支持；系统会自动在离线可用时走离线
+        if r.supportsOnDeviceRecognition { req.requiresOnDeviceRecognition = false }
         request = req
-
-        task = recognizer.recognitionTask(with: req) { [weak self] result, error in
+        task = r.recognitionTask(with: req) { [weak self] result, error in
             guard let self = self else { return }
-            if let result = result {
-                let text = result.bestTranscription.formattedString
-                    .replacingOccurrences(of: " ", with: "")
-                self.detect(text)
+            if let t = result?.bestTranscription.formattedString {
+                self.detect(t.replacingOccurrences(of: " ", with: ""))
             }
-            if error != nil || (result?.isFinal ?? false) {
-                // 任务结束（超时/出错），只要还在监听就自动重启，实现持续语音控制
-                self.queue.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-                    guard let self = self, self.active else { return }
-                    self.request = nil
-                    self.task = nil
-                    self.startRecognitionLocked()
+            if error != nil || result?.isFinal == true {
+                self.queue.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+                    guard let self = self, self.running else { return }
+                    self.request = nil; self.task = nil
+                    self.startTask()
                 }
             }
         }
     }
 
     private func detect(_ text: String) {
+        var cmd: String?
+        if text.contains("开始录像") || text.contains("开始录制") || text.contains("开拍") || text.contains("开始拍") {
+            cmd = "start"
+        } else if text.contains("停止录像") || text.contains("结束录像") || text.contains("停止录制")
+                    || text.contains("结束录制") || text.contains("停止拍摄") {
+            cmd = "stop"
+        }
+        guard let c = cmd else { return }
         let now = Date()
-        var command: String?
-        if text.contains("开始录像") || text.contains("开始录制") || text.contains("开拍") {
-            command = "start"
-        } else if text.contains("停止录像") || text.contains("结束录像")
-                    || text.contains("停止录制") || text.contains("结束录制") {
-            command = "stop"
-        }
-        guard let cmd = command else { return }
-        // 3 秒内相同命令去抖，防止同一句话分段重复触发
-        if lastCommand == cmd && now.timeIntervalSince(lastCommandAt) < 3 { return }
-        lastCommand = cmd
-        lastCommandAt = now
-        print("[Voice] command=\(cmd) text=\(text)")
-        DispatchQueue.main.async { self.onCommand?(cmd) }
+        if lastCmd == c && now.timeIntervalSince(lastCmdAt) < 3 { return }
+        lastCmd = c; lastCmdAt = now
+        print("[VOICE] \(c) <- \(text)")
+        DispatchQueue.main.async { self.onCommand?(c) }
     }
 
-    /// 相机音频帧喂给识别器（sessionQueue 调用）
-    func enqueue(_ sampleBuffer: CMSampleBuffer) {
-        guard active,
-              let pcm = Self.makePCMBuffer(from: sampleBuffer) else { return }
+    /// 喂入相机音频帧
+    func enqueue(_ sb: CMSampleBuffer) {
         queue.async { [weak self] in
-            self?.request?.append(pcm)
+            guard let self = self, self.running, let req = self.request else { return }
+            guard let out = self.convert(sb) else { return }
+            req.append(out)
         }
     }
 
-    private static func makePCMBuffer(from sampleBuffer: CMSampleBuffer) -> AVAudioPCMBuffer? {
-        guard let desc = CMSampleBufferGetFormatDescription(sampleBuffer) else { return nil }
-        let format = AVAudioFormat(cmAudioFormatDescription: desc)
-        let frames = AVAudioFrameCount(CMSampleBufferGetNumSamples(sampleBuffer))
-        guard frames > 0,
-              let pcm = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames) else { return nil }
-        pcm.frameLength = frames
-        let abl = pcm.mutableAudioBufferList
-        let status = CMSampleBufferCopyPCMDataIntoAudioBufferList(
-            sampleBuffer, at: 0, frameCount: Int32(frames), into: abl)
-        guard status == noErr else { return nil }
-        return pcm
+    private func convert(_ sb: CMSampleBuffer) -> AVAudioPCMBuffer? {
+        guard let desc = CMSampleBufferGetFormatDescription(sb) else { return nil }
+        let inFmt = AVAudioFormat(cmAudioFormatDescription: desc)
+        let same = converterFormat.map {
+            $0.sampleRate == inFmt.sampleRate
+            && $0.channelCount == inFmt.channelCount
+            && $0.commonFormat == inFmt.commonFormat
+            && $0.isInterleaved == inFmt.isInterleaved
+        } ?? false
+        if !same {
+            converter = AVAudioConverter(from: inFmt, to: targetFormat)
+            converterFormat = inFmt
+        }
+        guard let converter = converter else { return nil }
+        let inFrames = CMSampleBufferGetNumSamples(sb)
+        guard inFrames > 0,
+              let inBuf = AVAudioPCMBuffer(pcmFormat: inFmt, frameCapacity: AVAudioFrameCount(inFrames)) else { return nil }
+        inBuf.frameLength = AVAudioFrameCount(inFrames)
+        let st = CMSampleBufferCopyPCMDataIntoAudioBufferList(sb, at: 0,
+            frameCount: Int32(inFrames), into: inBuf.mutableAudioBufferList)
+        guard st == noErr else { return nil }
+
+        let ratio = targetFormat.sampleRate / inFmt.sampleRate
+        let cap = AVAudioFrameCount(Double(inFrames) * ratio) + 1024
+        guard let outBuf = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: cap) else { return nil }
+        var err: NSError?
+        var fed = false
+        converter.convert(to: outBuf, error: &err) { _, outPacket in
+            if fed { outPacket.pointee = nil; return .noDataNow }
+            fed = true
+            outPacket.pointee = inBuf
+            return .haveData
+        }
+        return err == nil ? outBuf : nil
     }
 }
 
-// MARK: - 提示音（AVAudioEngine 合成清脆“叮”声，不受静音键影响）
-final class SoundFeedback {
-    static let shared = SoundFeedback()
+// MARK: - 提示音
+final class Beep {
+    static let shared = Beep()
     private let engine = AVAudioEngine()
-    private let player = AVAudioPlayerNode()
-    private let format: AVAudioFormat
-
-    private init() {
-        format = AVAudioFormat(standardFormatWithSampleRate: 44100, channels: 1)!
-        engine.attach(player)
-        engine.connect(player, to: engine.mainMixerNode, format: format)
+    private let node = AVAudioPlayerNode()
+    private let fmt = AVAudioFormat(standardFormatWithSampleRate: 44100, channels: 1)!
+    init() {
+        engine.attach(node); engine.connect(node, to: engine.mainMixerNode, format: fmt)
     }
-
-    private func ensureRunning() {
-        guard !engine.isRunning else { return }
+    private func play(_ freq: Double, _ dur: Double, _ vol: Float, vibrate: Bool) {
         try? engine.start()
-    }
-
-    private func tone(frequency: Double, duration: Double, volume: Float, vibrate: Bool) {
-        ensureRunning()
-        let frames = AVAudioFrameCount(format.sampleRate * duration)
-        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames) else { return }
-        buffer.frameLength = frames
-        let ch = buffer.floatChannelData![0]
-        let sr = format.sampleRate
-        for i in 0..<Int(frames) {
-            let t = Double(i) / sr
-            let decay = exp(-4.0 * t)
-            let main = sin(2 * .pi * frequency * t)
-            let harmonic = 0.22 * sin(2 * .pi * frequency * 2 * t)
-            ch[i] = Float((main + harmonic) * decay) * volume
+        let n = AVAudioFrameCount(fmt.sampleRate * dur)
+        guard let b = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: n) else { return }
+        b.frameLength = n
+        let c = b.floatChannelData![0]
+        for i in 0..<Int(n) {
+            let t = Double(i) / fmt.sampleRate
+            let env = exp(-4.5 * t)
+            c[i] = Float((sin(2 * .pi * freq * t) + 0.2 * sin(4 * .pi * freq * t)) * env) * vol
         }
-        player.scheduleBuffer(buffer, at: nil, options: [])
-        player.play()
+        node.scheduleBuffer(b, at: nil); node.play()
         if vibrate { AudioServicesPlaySystemSound(kSystemSoundID_Vibrate) }
     }
-
-    func start() { tone(frequency: 1320, duration: 0.16, volume: 0.9, vibrate: true) }
-    func stop()  { tone(frequency: 880, duration: 0.24, volume: 0.9, vibrate: true) }
-    func tick()  { tone(frequency: 1000, duration: 0.06, volume: 0.55, vibrate: false) }
-    func on()    { tone(frequency: 1100, duration: 0.10, volume: 0.7, vibrate: false) }
-    func off()   { tone(frequency: 700, duration: 0.10, volume: 0.7, vibrate: false) }
-}
-
-// MARK: - 电量管理
-final class BatteryManager {
-    private var timer: Timer?
-    func start(_ onChange: @escaping (Float) -> Void) {
-        DispatchQueue.main.async {
-            UIDevice.current.isBatteryMonitoringEnabled = true
-            onChange(UIDevice.current.batteryLevel)
-        }
-        timer?.invalidate()
-        timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { _ in
-            Task { @MainActor in onChange(UIDevice.current.batteryLevel) }
-        }
-    }
-    deinit { timer?.invalidate() }
+    func start() { play(1320, 0.15, 0.9, vibrate: true) }
+    func stop()  { play(880, 0.25, 0.9, vibrate: true) }
+    func tap()   { play(1000, 0.05, 0.4, vibrate: false) }
+    func on()    { play(1100, 0.1, 0.7, vibrate: false) }
+    func off()   { play(700, 0.1, 0.7, vibrate: false) }
 }
 
 // MARK: - 相机引擎
 final class CameraEngine: NSObject, ObservableObject {
-    // UI 状态（仅主线程读写）
-    @Published var isSessionRunning = false
     @Published var isRecording = false
     @Published var isSaving = false
     @Published var isVoiceOn = false
     @Published var currentLens: CameraLens = .wide
-    @Published var preRecordOption: PreRecordOption = .s30
-    @Published var videoResolution: VideoResolution = .hd1080
-    @Published var frameRate: FrameRateOption = .fps30
-    @Published var stabilizationLevel: StabilizationLevel = .auto
-    @Published var isNightFillLightEnabled = false
-    @Published var isDelayCaptureEnabled = false
-    @Published var delayCaptureSeconds: Int = 3
-    @Published var batteryLevel: Float = 1.0
-    @Published var permissionDenied = false
-    @Published var lastMessage: String?
+    @Published var availableLenses: Set<CameraLens> = [.wide]
+    @Published var preRecord: PreRecordOption = .s30
+    @Published var quality: QualityOption = .hd1080169
+    @Published var frameRate: FrameRateOption = .auto
+    @Published var stabilization: StabilizationLevel = .auto
+    @Published var torchOn = false
+    @Published var delayOn = false
+    @Published var battery: Float = 1
+    @Published var denied = false
+    @Published var toast: String?
     @Published var countdown: Int?
+    @Published var actualFormat: String = ""
 
-    let captureSession = AVCaptureSession()
+    let session = AVCaptureSession()
+    private let sq = DispatchQueue(label: "com.actioncam.session")
+    private let vOut = AVCaptureVideoDataOutput()
+    private let aOut = AVCaptureAudioDataOutput()
+    private var device: AVCaptureDevice?
+    private var enc = VideoCompressor()
+    private var vRing = SampleRingBuffer(maxSeconds: 30)
+    private var aRing = SampleRingBuffer(maxSeconds: 30)
+    private let rec = Recorder()
 
-    private let sessionQueue = DispatchQueue(label: "com.actioncam.session")
-    private let videoOutput = AVCaptureVideoDataOutput()
-    private let audioOutput = AVCaptureAudioDataOutput()
-    private var currentVideoDevice: AVCaptureDevice?
-    private let compressor = VideoCompressor()
-    private var videoRing = SampleRingBuffer(maxSeconds: 30)
-    private var audioRing = SampleRingBuffer(maxSeconds: 30)
-    private let writer = PreRecordWriter()
-    private let battery = BatteryManager()
-
-    // 仅在 sessionQueue 访问
-    private var recording = false
-    private var preRecordSeconds: TimeInterval = 30
-    private var micEnabled = false
     private var started = false
+    private var recording = false
+    private var preSec: TimeInterval = 30
     private var delayTimer: Timer?
+    private var batteryTimer: Timer?
+
+    // 后置虚拟多摄（支持无缝 0.5/1/3 倍）
+    private var backVirtual: AVCaptureDevice?
+    private var backVirtualZooms: [CameraLens: CGFloat] = [:]
 
     override init() {
         super.init()
-        VoiceController.shared.onCommand = { [weak self] cmd in
+        VoiceController.shared.onCommand = { [weak self] c in
             guard let self = self else { return }
-            if cmd == "start" {
-                if !self.isRecording { self.startRecording() }
-            } else {
-                if self.isRecording { self.stopRecording() }
+            if c == "start" { if !self.isRecording { self.startRecording() } }
+            else { if self.isRecording { self.stopRecording() } }
+        }
+        VoiceController.shared.onState = { [weak self] on in self?.isVoiceOn = on }
+    }
+
+    // MARK: 启动
+    func start() {
+        sq.sync { if started { return }; started = true }
+        AVCaptureDevice.requestAccess(for: .video) { [weak self] g in
+            guard let self = self else { return }
+            guard g else { DispatchQueue.main.async { self.denied = true }; return }
+            AVCaptureDevice.requestAccess(for: .audio) { mic in
+                self.configAudio()
+                self.sq.async { self.buildSession(mic: mic) }
             }
         }
-        VoiceController.shared.onListeningChange = { [weak self] on in
-            self?.isVoiceOn = on
+        DispatchQueue.main.async {
+            UIDevice.current.isBatteryMonitoringEnabled = true
+            self.battery = UIDevice.current.batteryLevel
+            self.batteryTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+                self?.battery = UIDevice.current.batteryLevel
+            }
         }
     }
 
-    // MARK: 启动（先请求权限）
-    func startIfNeeded() {
-        let needStart = sessionQueue.sync { () -> Bool in
-            if started { return false }
-            started = true
-            return true
+    private func configAudio() {
+        do {
+            try AVAudioSession.sharedInstance().setCategory(.playAndRecord, mode: .videoRecording,
+                options: [.defaultToSpeaker, .allowBluetooth, .mixWithOthers])
+            try AVAudioSession.sharedInstance().setActive(true)
+        } catch {
+            try? AVAudioSession.sharedInstance().setCategory(.playback, options: [.mixWithOthers])
+            try? AVAudioSession.sharedInstance().setActive(true)
         }
-        guard needStart else { return }
+    }
 
-        AVCaptureDevice.requestAccess(for: .video) { [weak self] videoGranted in
-            guard let self = self else { return }
-            guard videoGranted else {
-                DispatchQueue.main.async { self.permissionDenied = true }
+    // MARK: 发现摄像头
+    private func discoverBackLenses() {
+        // 优先虚拟多摄
+        let types: [AVCaptureDevice.DeviceType] = [.builtInTripleCamera, .builtInDualWideCamera, .builtInDualCamera]
+        for t in types {
+            if let d = AVCaptureDevice.default(t, for: .video, position: .back) {
+                backVirtual = d
+                var lenses: Set<CameraLens> = [.wide]
+                var zooms: [CameraLens: CGFloat] = [.wide: 1.0]
+                let constituents = d.constituentDevices
+                let hasUltra = constituents.contains { $0.deviceType == .builtInUltraWideCamera }
+                let hasTele = constituents.contains { $0.deviceType == .builtInTelephotoCamera }
+                if hasUltra {
+                    lenses.insert(.ultraWide)
+                    zooms[.ultraWide] = max(d.minAvailableVideoZoomFactor, 0.5)
+                }
+                if hasTele {
+                    lenses.insert(.telephoto)
+                    let factors = d.virtualDeviceSwitchOverVideoZoomFactors
+                    if let last = factors.last {
+                        zooms[.telephoto] = CGFloat(truncating: last)
+                    } else {
+                        zooms[.telephoto] = 2.0
+                    }
+                }
+                backVirtualZooms = zooms
+                DispatchQueue.main.async {
+                    var all = lenses
+                    all.insert(.frontWide)
+                    self.availableLenses = all
+                }
                 return
             }
-            AVCaptureDevice.requestAccess(for: .audio) { micGranted in
-                self.setupAudioSession()
-                self.sessionQueue.async {
-                    self.micEnabled = micGranted
-                    self.buildSession(addAudio: micGranted)
-                }
+        }
+        // 回退：独立镜头
+        backVirtual = nil
+        var lenses: Set<CameraLens> = [.wide]
+        if AVCaptureDevice.default(.builtInUltraWideCamera, for: .video, position: .back) != nil { lenses.insert(.ultraWide) }
+        if AVCaptureDevice.default(.builtInTelephotoCamera, for: .video, position: .back) != nil { lenses.insert(.telephoto) }
+        lenses.insert(.frontWide)
+        DispatchQueue.main.async { self.availableLenses = lenses }
+    }
+
+    // MARK: 选择最匹配的 activeFormat
+    private func bestFormat(_ d: AVCaptureDevice, q: QualityOption, fps: Int) -> AVCaptureDevice.Format? {
+        let tw = q.targetWidth, th = q.targetHeight
+        let wantRatio = Double(tw) / Double(th)
+        var best: AVCaptureDevice.Format?
+        var bestScore = -Double.greatestFiniteMagnitude
+
+        for f in d.formats {
+            let desc = f.formatDescription
+            guard CMFormatDescriptionGetMediaType(desc) == kCMMediaType_Video else { continue }
+            let dim = CMVideoFormatDescriptionGetDimensions(desc)
+            guard dim.width > 0, dim.height > 0 else { continue }
+            let ranges = f.videoSupportedFrameRateRanges
+            guard !ranges.isEmpty else { continue }
+            let maxFps = ranges.map { $0.maxFrameRate }.max() ?? 0
+            let ratio = Double(dim.width) / Double(dim.height)
+            let ratioDiff = abs(ratio - wantRatio)
+
+            var score = 0.0
+            // 比例匹配权重最高
+            score -= ratioDiff * 10000
+            // 分辨率接近
+            let resDiff = abs(Double(dim.width) - Double(tw)) / Double(tw)
+                          + abs(Double(dim.height) - Double(th)) / Double(th)
+            score -= resDiff * 100
+            // 帧率支持（高帧率优先满足）
+            if fps > 0 {
+                if maxFps + 0.5 >= Double(fps) { score += 50 } else { score -= 200 }
             }
+            // 避免照片专用 binned 格式（高分低帧率的静态照片格式）
+            if maxFps < 24 { score -= 100 }
+
+            if score > bestScore { bestScore = score; best = f }
         }
-        Task { @MainActor in
-            battery.start { [weak self] level in self?.batteryLevel = level }
-        }
+        return best
     }
 
-    private func setupAudioSession() {
-        let s = AVAudioSession.sharedInstance()
-        do {
-            try s.setCategory(.playAndRecord, mode: .videoRecording,
-                              options: [.defaultToSpeaker, .allowBluetooth, .mixWithOthers])
-            try s.setActive(true)
-        } catch {
-            try? s.setCategory(.playback, mode: .default, options: [.mixWithOthers])
-            try? s.setActive(true)
-        }
-    }
+    // MARK: 构建采集会话
+    private func buildSession(mic: Bool? = nil) {
+        discoverBackLenses()
 
-    // MARK: 语音开关
-    func toggleVoice() {
-        if isVoiceOn {
-            VoiceController.shared.stop()
-            SoundFeedback.shared.off()
-            flash("语音控制已关闭")
+        // 决定使用的物理设备
+        var wantType: AVCaptureDevice.DeviceType = .builtInWideAngleCamera
+        var wantPos: AVCaptureDevice.Position = currentLens.position
+        if wantPos == .back, let v = backVirtual {
+            // 后置虚拟设备可承担所有后摄镜头
+            device = v
         } else {
-            VoiceController.shared.start { [weak self] ok, msg in
-                if ok {
-                    SoundFeedback.shared.on()
-                    self?.flash("语音已开启：说“开始录像/停止录像”")
-                } else {
-                    SoundFeedback.shared.off()
-                    self?.flash(msg)
-                }
+            switch currentLens {
+            case .ultraWide: wantType = .builtInUltraWideCamera
+            case .telephoto: wantType = .builtInTelephotoCamera
+            default: wantType = .builtInWideAngleCamera
             }
+            device = AVCaptureDevice.default(wantType, for: .video, position: wantPos)
+                ?? AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: wantPos)
         }
-    }
+        guard let dev = device else { flash("未找到摄像头"); return }
 
-    // MARK: 构建 / 重建采集会话
-    private func buildSession(addAudio: Bool? = nil) {
-        let useAudio = addAudio ?? micEnabled
-        captureSession.beginConfiguration()
-        captureSession.inputs.forEach { captureSession.removeInput($0) }
-        captureSession.outputs.forEach { captureSession.removeOutput($0) }
-        currentVideoDevice = nil
+        session.beginConfiguration()
+        session.inputs.forEach { session.removeInput($0) }
+        session.outputs.forEach { session.removeOutput($0) }
 
-        captureSession.sessionPreset = videoResolution.sessionPreset
+        // 关键：使用 activeFormat 时必须 inputPriority
+        session.sessionPreset = .inputPriority
 
-        guard let device = makeDevice(lens: currentLens),
-              let videoInput = try? AVCaptureDeviceInput(device: device),
-              captureSession.canAddInput(videoInput) else {
-            captureSession.commitConfiguration()
-            print("[Camera] no video device available")
-            return
+        guard let vInput = try? AVCaptureDeviceInput(device: dev), session.canAddInput(vInput) else {
+            session.commitConfiguration(); flash("无法添加摄像头"); return
         }
-        captureSession.addInput(videoInput)
-        currentVideoDevice = device
+        session.addInput(vInput)
 
-        if useAudio, let mic = AVCaptureDevice.default(for: .audio),
-           let micInput = try? AVCaptureDeviceInput(device: mic),
-           captureSession.canAddInput(micInput) {
-            captureSession.addInput(micInput)
-        }
-        micEnabled = useAudio
-
-        videoOutput.alwaysDiscardsLateVideoFrames = true
-        videoOutput.setSampleBufferDelegate(self, queue: sessionQueue)
-        if captureSession.canAddOutput(videoOutput) {
-            captureSession.addOutput(videoOutput)
+        if mic != false, let micDev = AVCaptureDevice.default(for: .audio),
+           let mInput = try? AVCaptureDeviceInput(device: micDev), session.canAddInput(mInput) {
+            session.addInput(mInput)
         }
 
-        audioOutput.setSampleBufferDelegate(self, queue: sessionQueue)
-        if useAudio && captureSession.canAddOutput(audioOutput) {
-            captureSession.addOutput(audioOutput)
+        vOut.alwaysDiscardsLateVideoFrames = true
+        vOut.setSampleBufferDelegate(self, queue: sq)
+        if session.canAddOutput(vOut) { session.addOutput(vOut) }
+
+        aOut.setSampleBufferDelegate(self, queue: sq)
+        if mic != false, session.canAddOutput(aOut) { session.addOutput(aOut) }
+
+        if let c = vOut.connection(with: .video) {
+            if c.isVideoOrientationSupported { c.videoOrientation = .portrait }
+            c.automaticallyAdjustsVideoMirroring = false
+            c.isVideoMirrored = (wantPos == .front)
         }
 
-        if let conn = videoOutput.connection(with: .video) {
-            if conn.isVideoOrientationSupported { conn.videoOrientation = .portrait }
-            conn.automaticallyAdjustsVideoMirroring = false
-            conn.isVideoMirrored = (currentLens.position == .front)
+        // 选择格式与帧率（需持有 device lock）
+        do {
+            try dev.lockForConfiguration()
+            applyFormatLocked(dev)
+            dev.unlockForConfiguration()
+        } catch {
+            print("[FMT] lock error: \(error)")
         }
 
-        let size = videoResolution.encodedSize
-        compressor.invalidate()
-        compressor.configure(width: size.width, height: size.height,
-                             fps: Int32(frameRate.rawValue), bitRate: size.bitrate)
-        compressor.onEncoded = { [weak self] sb in
-            self?.sessionQueue.async {
-                guard let self = self else { return }
-                if self.preRecordSeconds > 0 { self.videoRing.append(sb) }
-                if self.recording { self.writer.appendVideo(sb) }
-            }
-        }
+        session.commitConfiguration()
+        if !session.isRunning { session.startRunning() }
 
-        videoRing = SampleRingBuffer(maxSeconds: max(preRecordSeconds, 1))
-        audioRing = SampleRingBuffer(maxSeconds: max(preRecordSeconds, 1))
+        // 应用虚拟设备变焦（镜头切换）
+        if wantPos == .back, backVirtual === dev {
+            let z = backVirtualZooms[currentLens] ?? 1.0
+            do { try dev.lockForConfiguration(); dev.videoZoomFactor = z; dev.unlockForConfiguration() } catch {}
+        }
 
         applyStabilizationLocked()
-        applyFrameRateLocked()
-
-        captureSession.commitConfiguration()
-        if !captureSession.isRunning { captureSession.startRunning() }
-
-        DispatchQueue.main.async { self.isSessionRunning = true }
     }
 
-    private func makeDevice(lens: CameraLens) -> AVCaptureDevice? {
-        if let d = AVCaptureDevice.default(lens.deviceType, for: .video, position: lens.position) {
-            return d
+    /// 选择并应用格式。调用方必须已持有 device 的 configuration lock，且处于 begin/commit 之间。
+    private func applyFormatLocked(_ dev: AVCaptureDevice) {
+        let wantFps = frameRate.rawValue
+        guard let fmt = bestFormat(dev, q: quality, fps: wantFps) else {
+            print("[FMT] no match, fallback 1080p")
+            return
         }
-        return AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: lens.position)
+        dev.activeFormat = fmt
+        if wantFps > 0 {
+            let fpsD = Double(wantFps)
+            if fmt.videoSupportedFrameRateRanges.contains(where: {
+                fpsD >= $0.minFrameRate && fpsD <= $0.maxFrameRate
+            }) {
+                let t = CMTime(value: 1, timescale: CMTimeScale(wantFps))
+                dev.activeVideoMinFrameDuration = t
+                dev.activeVideoMaxFrameDuration = t
+            }
+        }
+
+        let dim = CMVideoFormatDescriptionGetDimensions(fmt.formatDescription)
+        let realMaxFps = fmt.videoSupportedFrameRateRanges.map { $0.maxFrameRate }.max() ?? 0
+        DispatchQueue.main.async {
+            self.actualFormat = "\(dim.width)×\(dim.height) @\(Int(realMaxFps))"
+        }
+        // 用实际格式尺寸配置编码器
+        let br: Int
+        if dim.width >= 3840 { br = 32_000_000 }
+        else if dim.width >= 1920 { br = 10_000_000 }
+        else { br = 5_000_000 }
+        let encFps: Int32 = wantFps > 0 ? Int32(min(wantFps, Int(realMaxFps))) : 30
+        enc.configure(width: dim.width, height: dim.height, fps: max(encFps, 24), bitRate: br)
+        enc.onEncoded = { [weak self] sb in
+            self?.sq.async {
+                guard let self = self else { return }
+                if self.preSec > 0 { self.vRing.append(sb) }
+                if self.recording { self.rec.appendVideo(sb) }
+            }
+        }
+        vRing = SampleRingBuffer(maxSeconds: max(preSec, 1))
+        aRing = SampleRingBuffer(maxSeconds: max(preSec, 1))
     }
 
     // MARK: 镜头切换
     func switchLens(_ lens: CameraLens) {
-        SoundFeedback.shared.tick()
-        sessionQueue.async { [weak self] in
+        guard availableLenses.contains(lens), lens != currentLens else { return }
+        Beep.shared.tap()
+        // 判断是否为安全的虚拟后摄变焦（录制中也允许）
+        let safeZoom = lens.position == .back && backVirtual != nil
+            && backVirtual === device
+        if isRecording && !safeZoom { flash("录制中无法切换到该镜头"); return }
+        currentLens = lens
+        sq.async { [weak self] in
             guard let self = self else { return }
-            self.captureSession.beginConfiguration()
-            self.captureSession.inputs
-                .filter { ($0 as? AVCaptureDeviceInput)?.device.hasMediaType(.video) == true }
-                .forEach { self.captureSession.removeInput($0) }
-
-            guard let device = self.makeDevice(lens: lens),
-                  let input = try? AVCaptureDeviceInput(device: device),
-                  self.captureSession.canAddInput(input) else {
-                self.captureSession.commitConfiguration()
-                return
+            // 虚拟后摄：直接变焦，无缝不中断
+            if lens.position == .back, let v = self.backVirtual, self.device === v {
+                let z = self.backVirtualZooms[lens] ?? 1.0
+                do { try v.lockForConfiguration()
+                    v.videoZoomFactor = z
+                    v.unlockForConfiguration()
+                } catch { print("[LENS] zoom error \(error)") }
+            } else {
+                // 前置或独立镜头：重建会话
+                self.buildSession()
             }
-            self.captureSession.addInput(input)
-            self.currentVideoDevice = device
-            if let conn = self.videoOutput.connection(with: .video) {
-                conn.automaticallyAdjustsVideoMirroring = false
-                conn.isVideoMirrored = (lens.position == .front)
-            }
-            self.applyStabilizationLocked()
-            self.applyFrameRateLocked()
-            self.captureSession.commitConfiguration()
-            DispatchQueue.main.async { self.currentLens = lens }
         }
     }
 
-    // MARK: 防抖 / 帧率
-    func applyStabilization() {
-        sessionQueue.async { [weak self] in self?.applyStabilizationLocked() }
+    // MARK: 设置
+    func setQuality(_ q: QualityOption) {
+        guard q != quality else { return }
+        if isRecording { flash("录制中无法切换分辨率"); return }
+        quality = q; Beep.shared.tap()
+        sq.async { [weak self] in
+            guard let self = self, let d = self.device else { return }
+            self.session.beginConfiguration()
+            self.session.sessionPreset = .inputPriority
+            do {
+                try d.lockForConfiguration()
+                self.applyFormatLocked(d)
+                d.unlockForConfiguration()
+            } catch {}
+            self.session.commitConfiguration()
+        }
+    }
+
+    func setFrameRate(_ f: FrameRateOption) {
+        guard f != frameRate else { return }
+        if isRecording { flash("录制中无法切换帧率"); return }
+        frameRate = f; Beep.shared.tap()
+        sq.async { [weak self] in
+            guard let self = self, let d = self.device else { return }
+            self.session.beginConfiguration()
+            self.session.sessionPreset = .inputPriority
+            do {
+                try d.lockForConfiguration()
+                self.applyFormatLocked(d)
+                d.unlockForConfiguration()
+            } catch {}
+            self.session.commitConfiguration()
+        }
+    }
+
+    func setPreRecord(_ p: PreRecordOption) {
+        preRecord = p; Beep.shared.tap(); preSec = p.seconds
+        sq.async { [weak self] in
+            self?.vRing = SampleRingBuffer(maxSeconds: max(p.seconds, 1))
+            self?.aRing = SampleRingBuffer(maxSeconds: max(p.seconds, 1))
+        }
+    }
+
+    func setStabilization(_ s: StabilizationLevel) {
+        stabilization = s; Beep.shared.tap()
+        sq.async { [weak self] in self?.applyStabilizationLocked() }
     }
 
     private func applyStabilizationLocked() {
-        guard let conn = videoOutput.connection(with: .video),
-              conn.isVideoStabilizationSupported else { return }
-        switch stabilizationLevel {
-        case .off:       conn.preferredVideoStabilizationMode = .off
-        case .standard:  conn.preferredVideoStabilizationMode = .standard
-        case .smooth:    conn.preferredVideoStabilizationMode = .cinematic
-        case .enhanced, .superMode:
-            conn.preferredVideoStabilizationMode = .cinematic
-        case .auto:      conn.preferredVideoStabilizationMode = .auto
+        guard let c = vOut.connection(with: .video), c.isVideoStabilizationSupported else { return }
+        c.preferredVideoStabilizationMode = stabilization.mode
+    }
+
+    func toggleTorch() {
+        torchOn.toggle(); Beep.shared.tap()
+        let on = torchOn
+        sq.async { [weak self] in
+            guard let self = self, let d = self.device, d.position == .back else { return }
+            do { try d.lockForConfiguration()
+                if on, d.hasTorch, d.isTorchAvailable { try d.setTorchModeOn(level: 1) }
+                else { d.torchMode = .off }
+                d.unlockForConfiguration()
+            } catch {}
         }
     }
 
-    func applyFrameRate() {
-        sessionQueue.async { [weak self] in self?.applyFrameRateLocked() }
-    }
-
-    private func applyFrameRateLocked() {
-        guard let device = currentVideoDevice else { return }
-        do {
-            try device.lockForConfiguration()
-            let fps = Double(frameRate.rawValue)
-            let supported = device.activeFormat.videoSupportedFrameRateRanges.contains {
-                fps >= $0.minFrameRate && fps <= $0.maxFrameRate
+    func toggleVoice() {
+        if isVoiceOn {
+            VoiceController.shared.stop(); Beep.shared.off(); flash("语音已关闭")
+        } else {
+            VoiceController.shared.start { [weak self] ok, msg in
+                if ok { Beep.shared.on() } else { Beep.shared.off() }
+                self?.flash(msg)
             }
-            if supported {
-                let t = CMTime(value: 1, timescale: Int32(fps))
-                device.activeVideoMinFrameDuration = t
-                device.activeVideoMaxFrameDuration = t
-            }
-            device.unlockForConfiguration()
-        } catch {
-            print("[Camera] framerate failed: \(error)")
         }
     }
 
-    // MARK: 设置变更
-    func setResolution(_ res: VideoResolution) {
-        guard res != videoResolution else { return }
-        videoResolution = res
-        SoundFeedback.shared.tick()
-        sessionQueue.async { [weak self] in self?.buildSession() }
-    }
-
-    func setPreRecord(_ option: PreRecordOption) {
-        SoundFeedback.shared.tick()
-        preRecordOption = option
-        sessionQueue.async { [weak self] in
-            guard let self = self else { return }
-            self.preRecordSeconds = option.seconds
-            self.videoRing = SampleRingBuffer(maxSeconds: max(option.seconds, 1))
-            self.audioRing = SampleRingBuffer(maxSeconds: max(option.seconds, 1))
-        }
-    }
-
-    // MARK: 录制控制
-    func toggleRecording() {
-        if isRecording { stopRecording() } else { startRecording() }
-    }
+    // MARK: 录制
+    func toggleRecord() { isRecording ? stopRecording() : startRecording() }
 
     func startRecording() {
-        if isDelayCaptureEnabled && delayCaptureSeconds > 0 {
-            var remaining = delayCaptureSeconds
-            DispatchQueue.main.async { self.countdown = remaining }
-            SoundFeedback.shared.tick()
+        if delayOn {
+            var n = 3
+            DispatchQueue.main.async { self.countdown = n }
+            Beep.shared.tap()
             delayTimer?.invalidate()
             delayTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] t in
                 guard let self = self else { t.invalidate(); return }
-                remaining -= 1
-                if remaining <= 0 {
-                    t.invalidate()
-                    self.delayTimer = nil
-                    self.countdown = nil
-                    self.performStart()
-                } else {
-                    self.countdown = remaining
-                    SoundFeedback.shared.tick()
-                }
+                n -= 1
+                if n <= 0 {
+                    t.invalidate(); self.delayTimer = nil; self.countdown = nil
+                    self.doStart()
+                } else { self.countdown = n; Beep.shared.tap() }
             }
-        } else {
-            performStart()
-        }
+        } else { doStart() }
     }
 
-    private func performStart() {
-        sessionQueue.async { [weak self] in
+    private func doStart() {
+        sq.async { [weak self] in
             guard let self = self, !self.recording else { return }
-            // 等待编码器产出格式描述（切分辨率后立即录制的情况）
+            // 等编码器就绪
             var tries = 0
-            while self.compressor.formatDescription == nil && tries < 50 {
-                usleep(10000); tries += 1
+            while self.enc.formatDescription == nil && tries < 100 { usleep(10000); tries += 1 }
+
+            let v = self.preSec > 0 ? self.vRing.snapshot() : []
+            let a = self.preSec > 0 ? self.aRing.snapshot() : []
+            let url = self.makeURL()
+            let portrait = self.currentLens.position == .back || self.currentLens == .frontWide
+            let ok = self.rec.begin(video: v, audio: a, url: url,
+                                    format: self.enc.formatDescription, portrait: portrait)
+            guard ok else {
+                DispatchQueue.main.async { self.flash("无法开始录制") }
+                return
             }
             self.recording = true
-            let v = self.preRecordSeconds > 0 ? self.videoRing.snapshot() : []
-            let a = self.preRecordSeconds > 0 ? self.audioRing.snapshot() : []
-            self.writer.begin(videoFrames: v, audioFrames: a,
-                              url: self.makeOutputURL(),
-                              videoFormat: self.compressor.formatDescription)
-            DispatchQueue.main.async {
-                self.isRecording = true
-                SoundFeedback.shared.start()
-            }
+            DispatchQueue.main.async { self.isRecording = true; Beep.shared.start() }
         }
     }
 
     func stopRecording() {
-        delayTimer?.invalidate()
-        delayTimer = nil
-        countdown = nil
-        SoundFeedback.shared.stop()
-        sessionQueue.async { [weak self] in
+        delayTimer?.invalidate(); delayTimer = nil; countdown = nil
+        Beep.shared.stop()
+        sq.async { [weak self] in
             guard let self = self, self.recording else { return }
             self.recording = false
-            DispatchQueue.main.async {
-                self.isRecording = false
-                self.isSaving = true
-            }
-            self.writer.finish { [weak self] url in
+            DispatchQueue.main.async { self.isRecording = false; self.isSaving = true }
+            self.rec.finish { [weak self] url in
                 guard let self = self else { return }
                 guard let url = url else {
-                    DispatchQueue.main.async {
-                        self.isSaving = false
-                        self.flash("保存失败")
-                    }
-                    return
+                    self.isSaving = false; self.flash("保存失败"); return
                 }
-                PhotoLibrarySaver.save(url) { ok in
-                    DispatchQueue.main.async {
-                        self.isSaving = false
-                        self.flash(ok ? "已保存到相册" : "保存失败")
-                    }
+                PhotoSaver.save(url) { ok in
+                    self.isSaving = false
+                    self.flash(ok ? "已保存到相册" : "保存失败")
                     try? FileManager.default.removeItem(at: url)
                 }
             }
         }
     }
 
-    private func makeOutputURL() -> URL {
-        let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        let f = DateFormatter()
-        f.dateFormat = "yyyyMMdd_HHmmss"
-        return dir.appendingPathComponent("Action_\(f.string(from: Date())).mp4")
+    private func makeURL() -> URL {
+        let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let f = DateFormatter(); f.dateFormat = "yyyyMMdd_HHmmss"
+        return d.appendingPathComponent("Action_\(f.string(from: Date())).mp4")
     }
 
-    func flash(_ text: String) {
-        lastMessage = text
+    func flash(_ m: String) {
+        toast = m
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
-            if self?.lastMessage == text { self?.lastMessage = nil }
-        }
-    }
-
-    // MARK: 补光灯
-    func toggleTorch() {
-        isNightFillLightEnabled.toggle()
-        SoundFeedback.shared.tick()
-        let on = isNightFillLightEnabled
-        sessionQueue.async { [weak self] in
-            guard let self = self, let device = self.currentVideoDevice else { return }
-            do {
-                try device.lockForConfiguration()
-                if on && device.isTorchAvailable {
-                    try device.setTorchModeOn(level: 1.0)
-                } else {
-                    device.torchMode = .off
-                }
-                device.unlockForConfiguration()
-            } catch {
-                print("[Torch] \(error)")
-            }
+            if self?.toast == m { self?.toast = nil }
         }
     }
 }
 
-// MARK: 采集回调（全部在 sessionQueue，不碰主线程）
+// MARK: 采集回调
 extension CameraEngine: AVCaptureVideoDataOutputSampleBufferDelegate,
                         AVCaptureAudioDataOutputSampleBufferDelegate {
-    func captureOutput(_ output: AVCaptureOutput,
-                       didOutput sampleBuffer: CMSampleBuffer,
-                       from connection: AVCaptureConnection) {
-        if output === videoOutput {
-            compressor.encode(sampleBuffer)
-        } else if output === audioOutput {
-            if preRecordSeconds > 0 { audioRing.append(sampleBuffer) }
-            if recording { writer.appendAudio(sampleBuffer) }
-            VoiceController.shared.enqueue(sampleBuffer)
+    func captureOutput(_ o: AVCaptureOutput, didOutput sb: CMSampleBuffer,
+                       from c: AVCaptureConnection) {
+        if o === vOut {
+            enc.encode(sb)
+        } else if o === aOut {
+            if preSec > 0 { aRing.append(sb) }
+            if recording { rec.appendAudio(sb) }
+            VoiceController.shared.enqueue(sb)
         }
     }
 }
 
-// MARK: - 主题
-enum Theme {
-    static let accent = Color(red: 0.15, green: 0.78, blue: 0.65)
-    static let recording = Color(red: 0.95, green: 0.30, blue: 0.25)
-    static let panelBg = Color.black.opacity(0.55)
-    static let cellBg = Color(red: 0.16, green: 0.16, blue: 0.18)
-    static let cellSelected = Color(red: 0.15, green: 0.78, blue: 0.65)
-}
-
-// MARK: - 相机预览
-struct CameraPreviewView: UIViewRepresentable {
+// MARK: - 预览
+struct Preview: UIViewRepresentable {
     let session: AVCaptureSession
-    func makeUIView(context: Context) -> PreviewUIView {
-        let v = PreviewUIView()
-        v.previewLayer.session = session
-        v.previewLayer.videoGravity = .resizeAspectFill
+    func makeUIView(context: Context) -> PreviewView {
+        let v = PreviewView()
+        let p = v.layer as! AVCaptureVideoPreviewLayer
+        p.session = session
+        p.videoGravity = .resizeAspectFill
         v.backgroundColor = .black
         return v
     }
-    func updateUIView(_ uiView: PreviewUIView, context: Context) {}
+    func updateUIView(_ uiView: PreviewView, context: Context) {}
 }
-
-final class PreviewUIView: UIView {
+final class PreviewView: UIView {
     override class var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }
-    var previewLayer: AVCaptureVideoPreviewLayer { layer as! AVCaptureVideoPreviewLayer }
 }
 
-// MARK: - 主屏幕
+// MARK: - 主题
+enum T {
+    static let accent = Color(red: 0.15, green: 0.78, blue: 0.65)
+    static let rec = Color(red: 0.95, green: 0.30, blue: 0.25)
+    static let panel = Color.black.opacity(0.55)
+    static let cell = Color(red: 0.16, green: 0.16, blue: 0.18)
+}
+
+// MARK: - 主界面
 struct CameraScreen: View {
-    @StateObject private var engine = CameraEngine()
+    @StateObject private var e = CameraEngine()
     @State private var showSettings = false
 
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
-            CameraPreviewView(session: engine.captureSession)
-                .ignoresSafeArea()
+            Preview(session: e.session).ignoresSafeArea()
 
-            if engine.permissionDenied {
+            if e.denied {
                 VStack(spacing: 16) {
-                    Image(systemName: "camera.metering.unknown")
-                        .font(.system(size: 48)).foregroundStyle(.white.opacity(0.7))
+                    Image(systemName: "camera.metering.unknown").font(.system(size: 48))
+                        .foregroundStyle(.white.opacity(0.7))
                     Text("需要相机权限").font(.headline).foregroundStyle(.white)
-                    Text("请在系统设置中允许访问相机后重试")
-                        .font(.subheadline).foregroundStyle(.white.opacity(0.6))
-                        .multilineTextAlignment(.center)
                     Button("打开系统设置") {
-                        if let url = URL(string: UIApplication.openSettingsURLString) {
-                            UIApplication.shared.open(url)
-                        }
+                        if let u = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(u) }
                     }
                     .padding(.horizontal, 20).padding(.vertical, 10)
-                    .background(Theme.accent).foregroundStyle(.black)
-                    .clipShape(Capsule())
+                    .background(T.accent).foregroundStyle(.black).clipShape(Capsule())
                 }
-                .padding(.horizontal, 40)
             }
 
-            // 顶部栏
+            // 顶部
             VStack {
                 HStack(spacing: 8) {
-                    HStack(spacing: 5) {
-                        Circle()
-                            .fill(engine.isRecording ? Theme.recording : Theme.accent)
-                            .frame(width: 8, height: 8)
-                        Text(engine.isRecording ? "REC" : (engine.preRecordOption.seconds > 0 ? "预录 \(Int(engine.preRecordOption.seconds))s" : "STBY"))
-                            .font(.system(size: 12, weight: .bold, design: .monospaced))
-                            .foregroundStyle(.white)
+                    Text(e.isRecording ? "● REC" : (e.preSec > 0 ? "预录\(Int(e.preSec))s" : "STBY"))
+                        .font(.system(size: 12, weight: .bold, design: .monospaced))
+                        .foregroundStyle(e.isRecording ? T.rec : .white)
+                        .padding(.horizontal, 10).padding(.vertical, 5)
+                        .background(T.panel).cornerRadius(6)
+                    if e.isVoiceOn {
+                        Label("语音", systemImage: "mic.fill")
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundStyle(T.accent)
+                            .padding(.horizontal, 8).padding(.vertical, 5)
+                            .background(T.panel).cornerRadius(6)
                     }
-                    .padding(.horizontal, 10).padding(.vertical, 5)
-                    .background(Theme.panelBg).cornerRadius(6)
-
-                    if engine.isVoiceOn {
-                        HStack(spacing: 4) {
-                            Image(systemName: "mic.fill")
-                                .font(.system(size: 10))
-                            Text("语音")
-                                .font(.system(size: 11, weight: .bold))
-                        }
-                        .foregroundStyle(Theme.accent)
-                        .padding(.horizontal, 8).padding(.vertical, 5)
-                        .background(Theme.panelBg).cornerRadius(6)
-                    }
-
-                    if engine.isSaving {
-                        Text("保存中…")
-                            .font(.system(size: 12, weight: .bold))
-                            .foregroundStyle(.white)
-                            .padding(.horizontal, 10).padding(.vertical, 5)
-                            .background(Theme.panelBg).cornerRadius(6)
-                    }
-
                     Spacer()
-
-                    Text("\(Int(engine.batteryLevel * 100))%")
+                    Text("\(Int(e.battery * 100))%")
                         .font(.system(size: 12, weight: .bold, design: .monospaced))
                         .foregroundStyle(.white)
-                        .padding(.horizontal, 10).padding(.vertical, 5)
-                        .background(Theme.panelBg).cornerRadius(6)
-
-                    Button { engine.toggleTorch() } label: {
-                        Image(systemName: engine.isNightFillLightEnabled ? "flashlight.on.fill" : "flashlight.off.fill")
-                            .font(.system(size: 15))
-                            .foregroundStyle(engine.isNightFillLightEnabled ? Theme.accent : .white)
-                            .frame(width: 34, height: 34)
-                            .background(Theme.panelBg).clipShape(Circle())
-                    }
-
-                    Button { showSettings = true } label: {
-                        Image(systemName: "gearshape.fill")
-                            .font(.system(size: 16)).foregroundStyle(.white)
-                            .frame(width: 34, height: 34)
-                            .background(Theme.panelBg).clipShape(Circle())
-                    }
+                        .padding(.horizontal, 8).padding(.vertical, 5)
+                        .background(T.panel).cornerRadius(6)
+                    IconButton(e.torchOn ? "flashlight.on.fill" : "flashlight.off.fill",
+                               on: e.torchOn) { e.toggleTorch() }
+                    IconButton("gearshape.fill", on: false) { showSettings = true }
                 }
-                .padding(.horizontal, 14)
-                .padding(.top, 6)
+                .padding(.horizontal, 12).padding(.top, 6)
                 Spacer()
             }
 
-            if let c = engine.countdown {
-                Text("\(c)")
-                    .font(.system(size: 96, weight: .bold, design: .rounded))
-                    .foregroundStyle(.white)
-                    .shadow(radius: 10)
+            // 实际格式提示
+            VStack {
+                Spacer().frame(height: 50)
+                if !e.actualFormat.isEmpty {
+                    Text(e.actualFormat)
+                        .font(.system(size: 10, weight: .medium, design: .monospaced))
+                        .foregroundStyle(.white.opacity(0.6))
+                        .padding(.horizontal, 8).padding(.vertical, 3)
+                        .background(T.panel).cornerRadius(4)
+                }
+                Spacer()
             }
 
-            if let msg = engine.lastMessage {
+            if let c = e.countdown {
+                Text("\(c)").font(.system(size: 96, weight: .bold, design: .rounded))
+                    .foregroundStyle(.white).shadow(radius: 10)
+            }
+
+            if let m = e.toast {
                 VStack {
-                    Spacer().frame(height: 120)
-                    Text(msg)
-                        .font(.system(size: 14, weight: .medium))
-                        .foregroundStyle(.white)
-                        .multilineTextAlignment(.center)
+                    Spacer().frame(height: 110)
+                    Text(m).font(.system(size: 14, weight: .medium))
+                        .foregroundStyle(.white).multilineTextAlignment(.center)
                         .padding(.horizontal, 18).padding(.vertical, 10)
-                        .background(Theme.panelBg).cornerRadius(20)
+                        .background(T.panel).cornerRadius(20)
                     Spacer()
                 }
             }
 
-            // 底部控制栏：麦克风 | 录制 | 镜头
+            if e.isSaving {
+                VStack {
+                    Spacer()
+                    Text("保存中…").font(.system(size: 13, weight: .bold)).foregroundStyle(.white)
+                        .padding(.horizontal, 16).padding(.vertical, 8)
+                        .background(T.panel).cornerRadius(16)
+                        .padding(.bottom, 120)
+                }
+            }
+
+            // 底部
             VStack {
                 Spacer()
                 HStack(spacing: 40) {
-                    Button { engine.toggleVoice() } label: {
+                    Button { e.toggleVoice() } label: {
                         ZStack {
-                            Circle()
-                                .fill(engine.isVoiceOn ? Theme.accent : Theme.panelBg)
-                                .frame(width: 56, height: 56)
-                            Image(systemName: engine.isVoiceOn ? "mic.fill" : "mic.slash.fill")
+                            Circle().fill(e.isVoiceOn ? T.accent : T.panel).frame(width: 56, height: 56)
+                            Image(systemName: e.isVoiceOn ? "mic.fill" : "mic.slash.fill")
                                 .font(.system(size: 20))
-                                .foregroundStyle(engine.isVoiceOn ? .black : .white)
-                            if engine.isVoiceOn {
-                                Circle()
-                                    .stroke(Theme.accent, lineWidth: 2)
-                                    .frame(width: 64, height: 64)
-                                    .opacity(0.6)
-                                    .scaleEffect(1.15)
-                                    .animation(.easeOut(duration: 1.1).repeatForever(autoreverses: true),
-                                               value: engine.isVoiceOn)
-                            }
+                                .foregroundStyle(e.isVoiceOn ? .black : .white)
                         }
                     }
-
-                    Button { engine.toggleRecording() } label: {
+                    Button { e.toggleRecord() } label: {
                         ZStack {
                             Circle().stroke(.white, lineWidth: 4).frame(width: 74, height: 74)
-                            if engine.isRecording {
-                                RoundedRectangle(cornerRadius: 7)
-                                    .fill(Theme.recording).frame(width: 30, height: 30)
+                            if e.isRecording {
+                                RoundedRectangle(cornerRadius: 7).fill(T.rec).frame(width: 30, height: 30)
                             } else {
-                                Circle().fill(Theme.recording).frame(width: 58, height: 58)
+                                Circle().fill(T.rec).frame(width: 58, height: 58)
                             }
                         }
-                    }
-                    .disabled(engine.isSaving)
-
+                    }.disabled(e.isSaving)
                     Button {
-                        let all = CameraLens.allCases
-                        let idx = all.firstIndex(of: engine.currentLens) ?? 0
-                        engine.switchLens(all[(idx + 1) % all.count])
+                        let all = CameraLens.allCases.filter { e.availableLenses.contains($0) }
+                        if let i = all.firstIndex(of: e.currentLens) {
+                            e.switchLens(all[(i + 1) % all.count])
+                        }
                     } label: {
-                        Text(engine.currentLens.shortName)
+                        Text(e.currentLens.shortName)
                             .font(.system(size: 14, weight: .bold))
                             .foregroundStyle(.white)
                             .frame(width: 56, height: 56)
-                            .background(Theme.panelBg).clipShape(Circle())
+                            .background(T.panel).clipShape(Circle())
                     }
                 }
                 .padding(.bottom, 34)
             }
         }
         .statusBarHidden(true)
-        .onAppear { engine.startIfNeeded() }
-        .sheet(isPresented: $showSettings) {
-            SettingsView(engine: engine)
+        .onAppear { e.start() }
+        .sheet(isPresented: $showSettings) { Settings(e: e) }
+    }
+}
+
+struct IconButton: View {
+    let icon: String; let on: Bool; let action: () -> Void
+    init(_ icon: String, on: Bool, action: @escaping () -> Void) {
+        self.icon = icon; self.on = on; self.action = action
+    }
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: icon).font(.system(size: 15))
+                .foregroundStyle(on ? T.accent : .white)
+                .frame(width: 34, height: 34).background(T.panel).clipShape(Circle())
         }
     }
 }
 
-// MARK: - 设置面板
-struct SettingsView: View {
-    @ObservedObject var engine: CameraEngine
+// MARK: - 设置
+struct Settings: View {
+    @ObservedObject var e: CameraEngine
     @Environment(\.dismiss) private var dismiss
-
-    private let columns = [GridItem(.flexible(), spacing: 10),
-                           GridItem(.flexible(), spacing: 10),
-                           GridItem(.flexible(), spacing: 10)]
+    private let cols = [GridItem(.flexible(), spacing: 10), GridItem(.flexible(), spacing: 10),
+                        GridItem(.flexible(), spacing: 10)]
 
     var body: some View {
         NavigationView {
             ScrollView {
                 VStack(alignment: .leading, spacing: 22) {
                     section("防抖") {
-                        LazyVGrid(columns: columns, spacing: 10) {
+                        LazyVGrid(columns: cols, spacing: 10) {
                             ForEach(StabilizationLevel.allCases, id: \.self) { v in
-                                SettingButton(title: v.rawValue, selected: engine.stabilizationLevel == v) {
-                                    engine.stabilizationLevel = v
-                                    engine.applyStabilization()
-                                }
+                                Cell(v.rawValue, sel: e.stabilization == v) { e.setStabilization(v) }
                             }
                         }
                     }
-
-                    section("预录") {
-                        LazyVGrid(columns: columns, spacing: 10) {
+                    section("预录时长") {
+                        LazyVGrid(columns: cols, spacing: 10) {
                             ForEach(PreRecordOption.allCases, id: \.self) { v in
-                                SettingButton(title: v.rawValue, selected: engine.preRecordOption == v) {
-                                    engine.setPreRecord(v)
-                                }
+                                Cell(v.label, sel: e.preRecord == v) { e.setPreRecord(v) }
                             }
                         }
                     }
-
-                    section("切换镜头") {
-                        LazyVGrid(columns: columns, spacing: 10) {
+                    section("镜头（仅显示本机支持）") {
+                        LazyVGrid(columns: cols, spacing: 10) {
                             ForEach(CameraLens.allCases, id: \.self) { v in
-                                SettingButton(title: v.rawValue, selected: engine.currentLens == v) {
-                                    engine.switchLens(v)
-                                }
+                                Cell(v.rawValue, sel: e.currentLens == v,
+                                     enabled: e.availableLenses.contains(v)) { e.switchLens(v) }
                             }
                         }
                     }
-
-                    section("分辨率") {
-                        LazyVGrid(columns: columns, spacing: 10) {
-                            ForEach(VideoResolution.allCases, id: \.self) { v in
-                                SettingButton(title: v.rawValue, selected: engine.videoResolution == v) {
-                                    engine.setResolution(v)
-                                }
+                    section("分辨率 / 比例") {
+                        LazyVGrid(columns: cols, spacing: 10) {
+                            ForEach(QualityOption.allCases, id: \.self) { v in
+                                Cell(v.rawValue, sel: e.quality == v) { e.setQuality(v) }
                             }
                         }
                     }
-
-                    section("帧率") {
-                        LazyVGrid(columns: columns, spacing: 10) {
+                    section("帧率（高帧率需设备支持）") {
+                        LazyVGrid(columns: cols, spacing: 10) {
                             ForEach(FrameRateOption.allCases, id: \.self) { v in
-                                SettingButton(title: v.displayName, selected: engine.frameRate == v) {
-                                    engine.frameRate = v
-                                    engine.applyFrameRate()
-                                }
+                                Cell(v.label, sel: e.frameRate == v) { e.setFrameRate(v) }
                             }
                         }
                     }
-
                     section("拍摄") {
-                        ToggleRow(title: "延迟拍摄（3秒）", isOn: $engine.isDelayCaptureEnabled)
-                        ToggleRow(title: "夜间补光", isOn: Binding(
-                            get: { engine.isNightFillLightEnabled },
-                            set: { v in if v != engine.isNightFillLightEnabled { engine.toggleTorch() } }
-                        ))
-                        ToggleRow(title: "语音控制（说开始/停止录像）", isOn: Binding(
-                            get: { engine.isVoiceOn },
-                            set: { v in if v != engine.isVoiceOn { engine.toggleVoice() } }
-                        ))
+                        ToggleRow("延迟拍摄（3秒）", $e.delayOn)
+                        ToggleRow("夜间补光", Binding(get: { e.torchOn },
+                            set: { v in if v != e.torchOn { e.toggleTorch() } }))
+                        ToggleRow("语音控制（开始/停止录像）", Binding(get: { e.isVoiceOn },
+                            set: { v in if v != e.isVoiceOn { e.toggleVoice() } }))
                     }
                 }
-                .padding(.horizontal, 16)
-                .padding(.bottom, 30)
+                .padding(.horizontal, 16).padding(.bottom, 30)
             }
             .background(Color(red: 0.08, green: 0.08, blue: 0.09).ignoresSafeArea())
-            .navigationTitle("设置")
+            .navigationTitle("相机设置")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
-                    Button("完成") { dismiss() }
-                        .font(.system(size: 16, weight: .bold))
-                        .foregroundStyle(Theme.accent)
+                    Button("完成") { dismiss() }.bold().foregroundStyle(T.accent)
                 }
             }
-        }
-        .preferredColorScheme(.dark)
+        }.preferredColorScheme(.dark)
     }
 
     @ViewBuilder
-    private func section<Content: View>(_ title: String,
-                                        @ViewBuilder content: () -> Content) -> some View {
+    private func section<C: View>(_ t: String, @ViewBuilder _ c: () -> C) -> some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text(title)
-                .font(.system(size: 13, weight: .bold))
-                .foregroundStyle(.white.opacity(0.5))
-            content()
+            Text(t).font(.system(size: 13, weight: .bold)).foregroundStyle(.white.opacity(0.5))
+            c()
         }
     }
 }
 
-struct SettingButton: View {
-    let title: String
-    let selected: Bool
-    let action: () -> Void
-
+struct Cell: View {
+    let title: String; let sel: Bool; let enabled: Bool; let action: () -> Void
+    init(_ title: String, sel: Bool, enabled: Bool = true, action: @escaping () -> Void) {
+        self.title = title; self.sel = sel; self.enabled = enabled; self.action = action
+    }
     var body: some View {
-        Button(action: action) {
+        Button { if enabled { action() } } label: {
             Text(title)
-                .font(.system(size: 14, weight: selected ? .bold : .regular))
-                .foregroundStyle(selected ? .black : .white)
-                .frame(maxWidth: .infinity)
-                .frame(height: 46)
-                .background(selected ? Theme.cellSelected : Theme.cellBg)
+                .font(.system(size: 13, weight: sel ? .bold : .regular))
+                .foregroundStyle(!enabled ? Color.gray.opacity(0.4) : (sel ? .black : .white))
+                .frame(maxWidth: .infinity).frame(height: 46)
+                .background(sel ? T.accent : T.cell)
                 .cornerRadius(10)
-        }
+        }.disabled(!enabled)
     }
 }
 
 struct ToggleRow: View {
-    let title: String
-    @Binding var isOn: Bool
-
+    let title: String; @Binding var on: Bool
+    init(_ title: String, _ on: Binding<Bool>) { self.title = title; self._on = on }
     var body: some View {
         HStack {
             Text(title).font(.system(size: 15)).foregroundStyle(.white)
             Spacer()
-            Toggle("", isOn: $isOn)
-                .labelsHidden()
-                .tint(Theme.accent)
+            Toggle("", isOn: $on).labelsHidden().tint(T.accent)
         }
-        .padding(.horizontal, 14)
-        .frame(height: 46)
-        .background(Theme.cellBg)
-        .cornerRadius(10)
+        .padding(.horizontal, 14).frame(height: 46).background(T.cell).cornerRadius(10)
     }
 }
