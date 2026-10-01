@@ -250,16 +250,19 @@ enum PreviewMode: String, CaseIterable {
 
 // MARK: - 音频反馈
 final class AudioFeedback {
+    // 大疆式提示音：1057 = 短促“滴”声，配合振动，录影启动/停止听感清晰
+    private let beep: SystemSoundID = 1057
+
     func sayStart() {
-        AudioServicesPlaySystemSound(1104) // 快门叮声
+        AudioServicesPlaySystemSound(beep)
         AudioServicesPlaySystemSound(kSystemSoundID_Vibrate)
     }
     func sayStop() {
-        AudioServicesPlaySystemSound(1104)
+        AudioServicesPlaySystemSound(beep)
         AudioServicesPlaySystemSound(kSystemSoundID_Vibrate)
     }
     func sayInterrupted() {
-        AudioServicesPlaySystemSound(1104)
+        AudioServicesPlaySystemSound(beep)
     }
 }
 
@@ -324,6 +327,8 @@ final class H264VideoEncoder {
 // MARK: - 相机引擎
 final class CameraEngine: NSObject, ObservableObject {
     @Published var isRecording = false
+    /// 预录是否正在工作（选择预录档位后即置位，供 UI 实时显示）
+    @Published var isPreRecordActive = false
     @Published var currentLens: CameraLens = .wide
     @Published var videoResolution: VideoResolution = .hd1080
     @Published var frameRate: FrameRateOption = .fps30
@@ -510,9 +515,11 @@ private let videoEncoder = H264VideoEncoder()
             compressedVideoBuffer = nil
             audioBuffer = nil
             preRecordOnInternal = false
+            DispatchQueue.main.async { self.isPreRecordActive = false }
             return
         }
         preRecordOnInternal = true
+        DispatchQueue.main.async { self.isPreRecordActive = true }
         // 缓冲内存放 H.264 压缩帧，占用很小；按实际帧率计算容量保留指定秒数
         // 出于内存安全仍做上限限制：视频 ≤ 30 秒，音频按 43 fps 采样估算
         let fps = max(Double(frameRate.rawValue), 15)
@@ -1033,6 +1040,8 @@ final class VoiceCommandManager {
     private var lastStart: TimeInterval = 0
     private var lastStop: TimeInterval = 0
     private let reqLock = NSLock()
+    /// 采样率缓存：麦克风音频多为 44.1k/48k，语音识别要求 16kHz，需重采样后再喂给识别器
+    private var resamplers: [String: AVAudioConverter] = [:]
 
     func start(_ onChange: @escaping (Bool) -> Void) {
         guard !running else { return }
@@ -1083,7 +1092,43 @@ final class VoiceCommandManager {
         guard running else { return }
         reqLock.lock(); let r = request; reqLock.unlock()
         guard let r = r, let pcm = sb.toPCMBuffer() else { return }
-        r.append(pcm)
+        // 识别器需要 16kHz 单声道；将采集到的原始采样率转为 16kHz 再喂入
+        guard let mono = Self.mono16k(pcm, cache: &self.resamplers, lock: self.reqLock) else { return }
+        r.append(mono)
+    }
+
+    /// 将任意格式音频转成 16kHz 单声道 float32（若已是 16kHz 单声道则原样返回）
+    private static func mono16k(_ src: AVAudioPCMBuffer,
+                                cache: inout [String: AVAudioConverter],
+                                lock: NSLock) -> AVAudioPCMBuffer? {
+        if Int(src.format.sampleRate) == 16000 && src.format.channelCount == 1 { return src }
+        guard let dst = AVAudioFormat(commonFormat: .pcmFormatFloat32,
+                                      sampleRate: 16000, channels: 1, interleaved: false) else { return nil }
+        let key = "\(Int(src.format.sampleRate))-\(src.format.channelCount)"
+        lock.lock()
+        var conv = cache[key]
+        if conv == nil {
+            conv = AVAudioConverter(from: src.format, to: dst)
+            cache[key] = conv
+        }
+        lock.unlock()
+        guard let converter = conv else { return nil }
+        let outCap = AVAudioFrameCount((Double(src.frameLength) * 16000.0 / src.format.sampleRate).rounded(.up)) + 256
+        guard let out = AVAudioPCMBuffer(pcmFormat: dst, frameCapacity: outCap) else { return nil }
+        var fed = false
+        var converted: AVAudioFrameCount = 0
+        while converted < outCap {
+            let st = converter.convert(to: out, error: nil) { p -> AVAudioBuffer? in
+                if fed { p.pointee = .endOfStream; return nil }
+                fed = true
+                p.pointee = .haveData
+                return src
+            }
+            if st == .error || st == .endOfStream { break }
+            converted = out.frameLength
+        }
+        out.frameLength = converted
+        return converted > 0 ? out : nil
     }
 
     func stop() {
@@ -1398,6 +1443,21 @@ struct CameraScreen: View {
 
             if engine.isVoiceListening {
                 GlassPill(text: "🎙 语音", color: Design.accent)
+            }
+            // 预录实时指示：开启预录后可见，提醒正在后台缓冲，开始录像时会带上开头N秒
+            if engine.isPreRecordActive && !engine.isRecording {
+                HStack(spacing: 5) {
+                    Circle()
+                        .fill(Design.accent)
+                        .frame(width: 7, height: 7)
+                    Text("PREREC")
+                        .font(Design.mono(10))
+                        .foregroundColor(Design.accent)
+                }
+                .padding(.horizontal, 10).padding(.vertical, 6)
+                .background(Design.glassBg)
+                .clipShape(Capsule())
+                .overlay(Capsule().stroke(Design.glassBorder, lineWidth: 0.5))
             }
             if engine.mirrorHorizontal { GlassPill(text: "H", color: Design.warmYellow) }
             if engine.mirrorVertical { GlassPill(text: "V", color: Design.warmYellow) }
