@@ -8,9 +8,43 @@ import Speech
 import MediaPlayer
 import VideoToolbox
 
+// MARK: - 崩溃日志捕获
+func installCrashHandler() {
+    NSSetUncaughtExceptionHandler { exception in
+        let log = "EXCEPTION: \(exception.name)\n\(exception.reason ?? "")\n\(exception.callStackSymbols.joined(separator: "\n"))"
+        CrashLogger.write(log)
+    }
+    signal(SIGABRT) { _ in CrashLogger.write("SIGABRT\n\(Thread.callStackSymbols.joined(separator: "\n"))"); exit(1) }
+    signal(SIGSEGV) { _ in CrashLogger.write("SIGSEGV\n\(Thread.callStackSymbols.joined(separator: "\n"))"); exit(1) }
+    signal(SIGBUS)  { _ in CrashLogger.write("SIGBUS\n\(Thread.callStackSymbols.joined(separator: "\n"))"); exit(1) }
+    signal(SIGILL)  { _ in CrashLogger.write("SIGILL\n\(Thread.callStackSymbols.joined(separator: "\n"))"); exit(1) }
+}
+
+enum CrashLogger {
+    static func write(_ text: String) {
+        let fm = FileManager.default
+        guard let dir = fm.urls(for: .documentDirectory, in: .userDomainMask).first else { return }
+        let url = dir.appendingPathComponent("crash_log.txt")
+        let ts = DateFormatter.localizedString(from: Date(), dateStyle: .medium, timeStyle: .full)
+        let content = "\n===== \(ts) =====\n\(text)\n"
+        if let data = content.data(using: .utf8) {
+            if fm.fileExists(atPath: url.path) {
+                if let handle = try? FileHandle(forWritingTo: url) {
+                    handle.seekToEndOfFile()
+                    handle.write(data)
+                    try? handle.close()
+                }
+            } else {
+                try? data.write(to: url)
+            }
+        }
+    }
+}
+
 // MARK: - App 入口
 @main
 struct FishingCameraApp: App {
+    init() { installCrashHandler() }
     var body: some Scene {
         WindowGroup {
             CameraScreen()
@@ -218,11 +252,11 @@ enum PreviewMode: String, CaseIterable {
 final class AudioFeedback {
     private let synthesizer = AVSpeechSynthesizer()
     func sayStart() {
-        AudioServicesPlaySystemSound(1113)
+        AudioServicesPlaySystemSound(1104) // 标准快门声，所有 iOS 版本都有
         speak("开始录像")
     }
     func sayStop() {
-        AudioServicesPlaySystemSound(1114)
+        AudioServicesPlaySystemSound(1104)
         speak("停止录像")
     }
     func sayInterrupted() { speak("来电中断，已保存") }
@@ -354,7 +388,8 @@ final class CameraEngine: NSObject, ObservableObject {
         super.init()
 
         let s = AVAudioSession.sharedInstance()
-        try? s.setCategory(.playAndRecord, mode: .videoChat,
+        // 不用 .videoChat mode（会改变音频路由/采样率，可能导致 AVSpeechSynthesizer 崩溃）
+        try? s.setCategory(.playAndRecord, mode: .default,
                            options: [.defaultToSpeaker, .allowBluetooth, .mixWithOthers])
         try? s.setActive(true)
 
@@ -649,25 +684,28 @@ final class CameraEngine: NSObject, ObservableObject {
     // MARK: - 录制
     func startRecording() {
         guard !isRecordingInternal else { return }
-        // ✅ 修复：仅在开关打开时播放快门声
-        if shutterSoundEnabled {
-            audioFeedback.sayStart()
-        }
         suppressVoice(2.0)
         resetScreenOffTimer()
 
         sessionQueue.async { [weak self] in
             guard let self = self, !self.isRecordingInternal else { return }
-            let all = self.compressedVideoBuffer?.snapshot() ?? []
-            let valid = self.trimToKeyframe(all)
-            let audios = self.audioBuffer?.snapshot() ?? []
-            self.writer.begin(
-                videoSamples: valid, audioSamples: audios,
-                outputURL: self.makeURL(),
-                mirrorVertical: self.mirrorVertical
-            )
-            self.isRecordingInternal = true
-            DispatchQueue.main.async { self.isRecording = true }
+            do {
+                let all = self.compressedVideoBuffer?.snapshot() ?? []
+                let valid = self.trimToKeyframe(all)
+                let audios = self.audioBuffer?.snapshot() ?? []
+                self.writer.begin(
+                    videoSamples: valid, audioSamples: audios,
+                    outputURL: self.makeURL(),
+                    mirrorVertical: self.mirrorVertical
+                )
+                self.isRecordingInternal = true
+                DispatchQueue.main.async {
+                    self.isRecording = true
+                    if self.shutterSoundEnabled { self.audioFeedback.sayStart() }
+                }
+            } catch {
+                print("[startRecording] error: \(error)")
+            }
         }
     }
 
