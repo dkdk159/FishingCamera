@@ -867,7 +867,7 @@ final class PreRecordWriter {
                         if vIn.isReadyForMoreMediaData, vIn.append(v[vi]) { self.appendedVideo += 1 }
                         vi += 1
                     } else {
-                        if aIn.isReadyForMoreMediaData { _ = aIn.append(a[ai]) }
+                        if let aIn = aIn, aIn.isReadyForMoreMediaData { _ = aIn.append(a[ai]) }
                         ai += 1
                     }
                 }
