@@ -1118,7 +1118,7 @@ final class VoiceCommandManager {
         var fed = false
         var converted: AVAudioFrameCount = 0
         while converted < outCap {
-            let st = converter.convert(to: out, error: nil) { p -> AVAudioBuffer? in
+            let st = converter.convert(to: out, error: nil) { _, p -> AVAudioBuffer? in
                 if fed { p.pointee = .endOfStream; return nil }
                 fed = true
                 p.pointee = .haveData
