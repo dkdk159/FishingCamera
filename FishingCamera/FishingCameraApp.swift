@@ -174,6 +174,7 @@ final class Recorder {
     private var vIn: AVAssetWriterInput?
     private var aIn: AVAssetWriterInput?
     private var finishing = false
+    private var sessionStarted = false
 
     var isActive: Bool { writer != nil && !finishing }
 
@@ -209,13 +210,14 @@ final class Recorder {
             var v = video
             if let ki = v.firstIndex(where: { isKeyFrame($0) }) { v = Array(v[ki...]) } else { v = [] }
             guard let start = v.first?.pts ?? audio.first?.pts else {
-                // 完全没有历史：先启动，实时帧再开始 session
+                // 完全没有历史：先启动 writer，等实时关键帧到达再 startSession
                 writer = w; vIn = vi; aIn = ai
                 print("[REC] begin no-history")
                 return true
             }
             var a = audio.filter { $0.pts.seconds >= start.seconds - 0.002 }
             w.startSession(atSourceTime: start)
+            sessionStarted = true
 
             // 交错写入历史（等待输入就绪，避免丢历史帧）
             var vi2 = 0, ai2 = 0
@@ -242,7 +244,7 @@ final class Recorder {
         var n = 0
         while !input.isReadyForMoreMediaData, n < 50 {
             usleep(10_000); n += 1
-            if Thread.isCancelled { return false }
+            if Thread.current.isCancelled { return false }
         }
         return input.isReadyForMoreMediaData
     }
@@ -250,10 +252,11 @@ final class Recorder {
     func appendVideo(_ sb: CMSampleBuffer) {
         guard let w = writer, !finishing else { return }
         if w.status != .writing { return }
-        if w.sessionStartTime.isNaN {
+        if !sessionStarted {
             // session 尚未开始（无历史帧情形）：必须从关键帧开始
             guard isKeyFrame(sb) else { return }
             w.startSession(atSourceTime: sb.pts)
+            sessionStarted = true
         }
         if vIn?.isReadyForMoreMediaData == true { vIn?.append(sb) }
     }
@@ -261,7 +264,10 @@ final class Recorder {
     func appendAudio(_ sb: CMSampleBuffer) {
         guard let w = writer, !finishing else { return }
         if w.status != .writing { return }
-        if w.sessionStartTime.isNaN { w.startSession(atSourceTime: sb.pts) }
+        if !sessionStarted {
+            w.startSession(atSourceTime: sb.pts)
+            sessionStarted = true
+        }
         if aIn?.isReadyForMoreMediaData == true { aIn?.append(sb) }
     }
 
@@ -273,7 +279,8 @@ final class Recorder {
             let url = w.status == .completed ? w.outputURL : nil
             if let e = w.error { print("[REC] finish error: \(e)") }
             DispatchQueue.main.async {
-                self?.writer = nil; self?.vIn = nil; self?.aIn = nil; self?.finishing = false
+                self?.writer = nil; self?.vIn = nil; self?.aIn = nil
+                self?.finishing = false; self?.sessionStarted = false
                 done(url)
             }
         }
@@ -425,13 +432,16 @@ final class VoiceController {
         guard let outBuf = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: cap) else { return nil }
         var err: NSError?
         var fed = false
-        converter.convert(to: outBuf, error: &err) { _, outPacket in
-            if fed { outPacket.pointee = nil; return .noDataNow }
+        let ok = converter.convert(to: outBuf, error: &err) { _, outStatus in
+            if fed {
+                outStatus.pointee = .noDataNow
+                return nil
+            }
             fed = true
-            outPacket.pointee = inBuf
-            return .haveData
+            outStatus.pointee = .haveData
+            return inBuf
         }
-        return err == nil ? outBuf : nil
+        return (ok && err == nil) ? outBuf : nil
     }
 }
 
@@ -984,7 +994,7 @@ struct CameraScreen: View {
             // 顶部
             VStack {
                 HStack(spacing: 8) {
-                    Text(e.isRecording ? "● REC" : (e.preSec > 0 ? "预录\(Int(e.preSec))s" : "STBY"))
+                    Text(e.isRecording ? "● REC" : (e.preRecord.rawValue > 0 ? "预录\(e.preRecord.rawValue)s" : "STBY"))
                         .font(.system(size: 12, weight: .bold, design: .monospaced))
                         .foregroundStyle(e.isRecording ? T.rec : .white)
                         .padding(.horizontal, 10).padding(.vertical, 5)
@@ -1169,7 +1179,7 @@ struct Settings: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
-                    Button("完成") { dismiss() }.bold().foregroundStyle(T.accent)
+                    Button("完成") { dismiss() }.fontWeight(.bold).foregroundStyle(T.accent)
                 }
             }
         }.preferredColorScheme(.dark)
