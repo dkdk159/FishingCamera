@@ -670,6 +670,15 @@ final class CameraEngine: NSObject, ObservableObject {
         return best
     }
 
+    /// 让 activeFormat 生效：iOS 15+ 用 inputPriority；iOS 14 用 high（锁定 activeFormat 后格式优先生效）
+    private func applyInputPriorityPreset() {
+        if #available(iOS 15.0, *) {
+            session.sessionPreset = .inputPriority
+        } else {
+            session.sessionPreset = .high
+        }
+    }
+
     // MARK: 构建采集会话
     private func buildSession() {
         discoverBackLenses()
@@ -692,8 +701,8 @@ final class CameraEngine: NSObject, ObservableObject {
         session.beginConfiguration()
         session.inputs.forEach { session.removeInput($0) }
         session.outputs.forEach { session.removeOutput($0) }
-        // 使用 activeFormat 时必须 inputPriority，否则分辨率/比例设置无效
-        session.sessionPreset = .inputPriority
+        // 让 activeFormat 生效（iOS 14/15+ 分别处理），否则分辨率/比例设置无效
+        applyInputPriorityPreset()
 
         guard let vInput = try? AVCaptureDeviceInput(device: dev), session.canAddInput(vInput) else {
             session.commitConfiguration(); flash("无法添加摄像头"); return
@@ -807,7 +816,7 @@ final class CameraEngine: NSObject, ObservableObject {
         sq.async { [weak self] in
             guard let self = self, let d = self.device else { return }
             self.session.beginConfiguration()
-            self.session.sessionPreset = .inputPriority
+            self.applyInputPriorityPreset()
             do { try d.lockForConfiguration(); self.applyFormat(d); d.unlockForConfiguration() } catch {}
             self.session.commitConfiguration()
         }
@@ -820,7 +829,7 @@ final class CameraEngine: NSObject, ObservableObject {
         sq.async { [weak self] in
             guard let self = self, let d = self.device else { return }
             self.session.beginConfiguration()
-            self.session.sessionPreset = .inputPriority
+            self.applyInputPriorityPreset()
             do { try d.lockForConfiguration(); self.applyFormat(d); d.unlockForConfiguration() } catch {}
             self.session.commitConfiguration()
         }
