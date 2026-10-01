@@ -325,6 +325,8 @@ final class CameraEngine: NSObject, ObservableObject {
     private let audioOutput = AVCaptureAudioDataOutput()
     private var currentVideoDevice: AVCaptureDevice?
     private let encoder = H264VideoEncoder()
+    private var encoderWidth = 0
+    private var encoderHeight = 0
     private var compressedVideoBuffer: CircularFrameBuffer<CMSampleBuffer>?
     private var audioBuffer: CircularFrameBuffer<CMSampleBuffer>?
     private let writer = PreRecordWriter()
@@ -667,14 +669,10 @@ final class CameraEngine: NSObject, ObservableObject {
 
     private func trimToKeyframe(_ samples: [CMSampleBuffer]) -> [CMSampleBuffer] {
         for (i, s) in samples.enumerated() {
-            guard let arr = CMSampleBufferGetSampleAttachmentsArray(s, createIfNecessary: false) else {
-                return Array(samples[i...])
-            }
-            if CFArrayGetCount(arr) == 0 { return Array(samples[i...]) }
-            guard let d = unsafeBitCast(CFArrayGetValueAtIndex(arr, 0), to: CFDictionary?.self) else {
-                return Array(samples[i...])
-            }
-            let notSync = CFDictionaryContainsKey(d, Unmanaged.passUnretained(kCMSampleAttachmentKey_NotSync).toOpaque())
+            guard let arr = CMSampleBufferGetSampleAttachmentsArray(s, createIfNecessary: false)
+                as? [[CFString: Any]] else { return Array(samples[i...]) }
+            guard let d = arr.first else { return Array(samples[i...]) }
+            let notSync = d[kCMSampleAttachmentKey_NotSync] as? Bool ?? false
             if !notSync { return Array(samples[i...]) }
         }
         return samples
@@ -710,6 +708,14 @@ extension CameraEngine: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureA
         if output === videoOutput {
             guard let pb = CMSampleBufferGetImageBuffer(sb) else { return }
             let pts = CMSampleBufferGetPresentationTimeStamp(sb)
+            // 校验实际帧尺寸与编码器是否匹配，不匹配则重配（防止 VTCompressionSessionEncodeFrame 崩溃）
+            let w = CVPixelBufferGetWidth(pb)
+            let h = CVPixelBufferGetHeight(pb)
+            if w != encoderWidth || h != encoderHeight {
+                encoderWidth = w; encoderHeight = h
+                encoder.setup(width: w, height: h, fps: frameRate.rawValue,
+                              bitrate: computeBitrate(resolution: videoResolution, fps: frameRate.rawValue))
+            }
             encoder.encode(pixelBuffer: pb, presentationTime: pts, forceKeyframe: isRecordingInternal)
         } else if output === audioOutput {
             if preRecordOnInternal, var b = audioBuffer { b.write(sb) }
