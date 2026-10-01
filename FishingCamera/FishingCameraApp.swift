@@ -248,19 +248,15 @@ enum PreviewMode: String, CaseIterable {
     }
 }
 
-// MARK: - 音频反馈（只叮一声，不播报语音）
+// MARK: - 音频反馈（暂时禁用声音，排查闪退）
 final class AudioFeedback {
     func sayStart() {
-        AudioServicesPlaySystemSound(1104) // 快门叮声
-        AudioServicesPlaySystemSound(kSystemSoundID_Vibrate)
+        // 暂时禁用，排查是否声音导致闪退
     }
     func sayStop() {
-        AudioServicesPlaySystemSound(1104)
-        AudioServicesPlaySystemSound(kSystemSoundID_Vibrate)
+        // 暂时禁用
     }
-    func sayInterrupted() {
-        AudioServicesPlaySystemSound(1104)
-    }
+    func sayInterrupted() {}
 }
 
 // MARK: - H.264 编码器
@@ -682,8 +678,9 @@ final class CameraEngine: NSObject, ObservableObject {
     // MARK: - 录制
     func startRecording() {
         guard !isRecordingInternal else { return }
-        suppressVoice(2.0)
-        resetScreenOffTimer()
+        // 暂时禁用声音和Timer，排查闪退
+        // suppressVoice(2.0)
+        // resetScreenOffTimer()
 
         sessionQueue.async { [weak self] in
             guard let self = self, !self.isRecordingInternal else { return }
@@ -700,7 +697,7 @@ final class CameraEngine: NSObject, ObservableObject {
                     self.isRecordingInternal = true
                     DispatchQueue.main.async {
                         self.isRecording = true
-                        if self.shutterSoundEnabled { self.audioFeedback.sayStart() }
+                        // 暂时禁用声音
                     }
                 } else {
                     print("[startRecording] writer.begin 失败")
@@ -726,9 +723,6 @@ final class CameraEngine: NSObject, ObservableObject {
 
     func stopRecording() {
         guard isRecordingInternal else { return }
-        if shutterSoundEnabled { audioFeedback.sayStop() }
-        suppressVoice(2.0)
-        resetScreenOffTimer()
         sessionQueue.async { [weak self] in
             guard let self = self, self.isRecordingInternal else { return }
             self.writer.end()
