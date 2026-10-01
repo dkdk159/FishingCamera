@@ -351,9 +351,6 @@ final class CameraEngine: NSObject, ObservableObject {
     private let videoOutput = AVCaptureVideoDataOutput()
     private let audioOutput = AVCaptureAudioDataOutput()
     private var currentVideoDevice: AVCaptureDevice?
-    private let encoder = H264VideoEncoder()
-    private var encoderWidth = 0
-    private var encoderHeight = 0
     private var compressedVideoBuffer: CircularFrameBuffer<CMSampleBuffer>?
     private var audioBuffer: CircularFrameBuffer<CMSampleBuffer>?
     private let writer = PreRecordWriter()
@@ -396,16 +393,6 @@ final class CameraEngine: NSObject, ObservableObject {
             DispatchQueue.main.async {
                 guard let self = self, !self.shouldSuppressVoice(), self.isRecordingInternal else { return }
                 self.stopRecording()
-            }
-        }
-        encoder.onEncodedSample = { [weak self] sb in
-            guard let self = self else { return }
-            // 深拷贝：VideoToolbox 回调返回后 sb 内部的 CMBlockBuffer 可能被释放
-            // 必须创建一个拥有独立内存的 CMBlockBuffer，再包装成新的 CMSampleBuffer
-            guard let copied = Self.deepCopyEncodedSample(sb) else { return }
-            self.sessionQueue.async {
-                if self.preRecordOnInternal { self.compressedVideoBuffer?.write(copied) }
-                if self.isRecordingInternal { self.writer.appendVideo(copied) }
             }
         }
         MPRemoteCommandCenter.shared().togglePlayPauseCommand.addTarget { [weak self] _ in
@@ -495,24 +482,6 @@ final class CameraEngine: NSObject, ObservableObject {
         }
     }
 
-    private func setupEncoder() {
-        let (w, h) = videoResolution.outputSize
-        let fps = frameRate.rawValue
-        encoder.setup(width: w, height: h, fps: fps, bitrate: computeBitrate(resolution: videoResolution, fps: fps))
-    }
-
-    private func computeBitrate(resolution: VideoResolution, fps: Int) -> Int {
-        let base: Int
-        switch resolution {
-        case .uhd4K, .uhd4K4x3: base = 40_000_000
-        case .k3_4x3, .k2_5_4x3: base = 30_000_000
-        case .k2_4x3: base = 20_000_000
-        case .hd1080, .hd1080_4x3: base = 16_000_000
-        case .hd720: base = 8_000_000
-        }
-        return base * max(fps, 24) / 30
-    }
-
     private func deviceFor(_ lens: CameraLens) -> AVCaptureDevice? {
         AVCaptureDevice.default(lens.deviceType, for: .video, position: lens.position)
     }
@@ -526,8 +495,10 @@ final class CameraEngine: NSObject, ObservableObject {
             return
         }
         preRecordOnInternal = true
-        compressedVideoBuffer = CircularFrameBuffer<CMSampleBuffer>(capacity: Int(30.0 * sec))
-        audioBuffer = CircularFrameBuffer<CMSampleBuffer>(capacity: Int(43.0 * sec))
+        // 未压缩帧内存大，限制最多 10 秒（300帧）防止 OOM
+        let limitedSec = min(sec, 10)
+        compressedVideoBuffer = CircularFrameBuffer<CMSampleBuffer>(capacity: Int(30.0 * limitedSec))
+        audioBuffer = CircularFrameBuffer<CMSampleBuffer>(capacity: Int(43.0 * limitedSec))
     }
 
     private func applyFrameRate() {
@@ -746,9 +717,9 @@ final class CameraEngine: NSObject, ObservableObject {
         return samples
     }
 
-    /// 深拷贝 VideoToolbox 输出的 CMSampleBuffer，创建拥有独立内存的副本
-    /// 防止回调返回后内部 CMBlockBuffer 被系统回收导致悬垂指针
-    static func deepCopyEncodedSample(_ sb: CMSampleBuffer) -> CMSampleBuffer? {
+    /// 深拷贝 CMSampleBuffer，创建拥有独立内存的副本
+    /// 防止回调返回后内部 buffer 被系统回收导致悬垂指针
+    static func deepCopySample(_ sb: CMSampleBuffer) -> CMSampleBuffer? {
         // 先用系统方法复制（会 retain 内部 buffer）
         var copy: CMSampleBuffer?
         let st = CMSampleBufferCreateCopy(allocator: kCFAllocatorDefault, sampleBuffer: sb, sampleBufferOut: &copy)
@@ -805,20 +776,14 @@ final class CameraEngine: NSObject, ObservableObject {
 extension CameraEngine: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate {
     func captureOutput(_ output: AVCaptureOutput, didOutput sb: CMSampleBuffer, from conn: AVCaptureConnection) {
         if output === videoOutput {
-            guard let pb = CMSampleBufferGetImageBuffer(sb) else { return }
-            let pts = CMSampleBufferGetPresentationTimeStamp(sb)
-            // 按实际帧尺寸初始化编码器
-            let w = CVPixelBufferGetWidth(pb)
-            let h = CVPixelBufferGetHeight(pb)
-            if w != encoderWidth || h != encoderHeight {
-                encoderWidth = w; encoderHeight = h
-                encoder.setup(width: w, height: h, fps: frameRate.rawValue,
-                              bitrate: computeBitrate(resolution: videoResolution, fps: frameRate.rawValue))
+            // 直接存未压缩帧到环形缓冲（不用 VideoToolbox，避免编码悬垂指针）
+            if let copy = Self.deepCopySample(sb) {
+                if preRecordOnInternal { compressedVideoBuffer?.write(copy) }
+                if isRecordingInternal { writer.appendVideo(copy) }
             }
-            encoder.encode(pixelBuffer: pb, presentationTime: pts, forceKeyframe: isRecordingInternal)
         } else if output === audioOutput {
             // 音频帧深拷贝后存入缓冲，用于预录
-            if let aCopy = Self.deepCopyEncodedSample(sb) {
+            if let aCopy = Self.deepCopySample(sb) {
                 if preRecordOnInternal, var b = audioBuffer { b.write(aCopy) }
                 if isRecordingInternal { writer.appendAudio(aCopy) }
             }
@@ -852,14 +817,31 @@ final class PreRecordWriter {
                 let w = try AVAssetWriter(outputURL: outputURL, fileType: .mp4)
 
                 var hint: CMFormatDescription? = nil
+                var videoSize = CGSize(width: 1920, height: 1080)
                 for s in videoSamples {
-                    if let fd = CMSampleBufferGetFormatDescription(s) { hint = fd; break }
+                    if let fd = CMSampleBufferGetFormatDescription(s) {
+                        hint = fd
+                        if let pb = CMSampleBufferGetImageBuffer(s) {
+                            videoSize = CGSize(width: CVPixelBufferGetWidth(pb), height: CVPixelBufferGetHeight(pb))
+                        }
+                        break
+                    }
                 }
                 guard let vfd = hint else {
                     print("[Writer] 无视频格式")
                     DispatchQueue.main.async { completion(false) }; return
                 }
-                let vIn = AVAssetWriterInput(mediaType: .video, outputSettings: nil, sourceFormatHint: vfd)
+                // 用 outputSettings 让 AVAssetWriter 自己编码未压缩帧（不用 passthrough）
+                let videoSettings: [String: Any] = [
+                    AVVideoCodecKey: AVVideoCodecType.h264,
+                    AVVideoWidthKey: Int(videoSize.width),
+                    AVVideoHeightKey: Int(videoSize.height),
+                    AVVideoCompressionPropertiesKey: [
+                        AVVideoAverageBitRateKey: Int(videoSize.width * videoSize.height * 2),
+                        AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel
+                    ]
+                ]
+                let vIn = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings, sourceFormatHint: vfd)
                 vIn.expectsMediaDataInRealTime = false
                 if mirrorVertical {
                     var t = CGAffineTransform.identity
@@ -895,7 +877,7 @@ final class PreRecordWriter {
                 }
 
                 var v = videoSamples
-                if let ki = v.firstIndex(where: { isKeyFrame($0) }) { v = Array(v[ki...]) } else { v = [] }
+                // 未压缩帧没有关键帧概念，不过滤
                 let start: CMTime
                 if let f = v.first { start = CMSampleBufferGetPresentationTimeStamp(f) }
                 else if let f = audioSamples.first { start = CMSampleBufferGetPresentationTimeStamp(f) }
