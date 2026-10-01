@@ -248,25 +248,18 @@ enum PreviewMode: String, CaseIterable {
     }
 }
 
-// MARK: - 音频反馈
+// MARK: - 音频反馈（只叮一声，不播报语音）
 final class AudioFeedback {
-    private let synthesizer = AVSpeechSynthesizer()
     func sayStart() {
-        AudioServicesPlaySystemSound(1104) // 标准快门声，所有 iOS 版本都有
-        speak("开始录像")
+        AudioServicesPlaySystemSound(1104) // 快门叮声
+        AudioServicesPlaySystemSound(kSystemSoundID_Vibrate)
     }
     func sayStop() {
         AudioServicesPlaySystemSound(1104)
-        speak("停止录像")
+        AudioServicesPlaySystemSound(kSystemSoundID_Vibrate)
     }
-    func sayInterrupted() { speak("来电中断，已保存") }
-
-    private func speak(_ t: String) {
-        synthesizer.stopSpeaking(at: .immediate)
-        let u = AVSpeechUtterance(string: t)
-        u.voice = AVSpeechSynthesisVoice(language: "zh-CN")
-        u.rate = 0.52; u.volume = 1.0
-        synthesizer.speak(u)
+    func sayInterrupted() {
+        AudioServicesPlaySystemSound(1104)
     }
 }
 
@@ -394,12 +387,16 @@ final class CameraEngine: NSObject, ObservableObject {
         try? s.setActive(true)
 
         voiceManager.onStart = { [weak self] in
-            guard let self = self, !self.shouldSuppressVoice(), !self.isRecordingInternal else { return }
-            self.startRecording()
+            DispatchQueue.main.async {
+                guard let self = self, !self.shouldSuppressVoice(), !self.isRecordingInternal else { return }
+                self.startRecording()
+            }
         }
         voiceManager.onStop = { [weak self] in
-            guard let self = self, !self.shouldSuppressVoice(), self.isRecordingInternal else { return }
-            self.stopRecording()
+            DispatchQueue.main.async {
+                guard let self = self, !self.shouldSuppressVoice(), self.isRecordingInternal else { return }
+                self.stopRecording()
+            }
         }
         encoder.onEncodedSample = { [weak self] sb in
             guard let self = self else { return }
@@ -689,22 +686,28 @@ final class CameraEngine: NSObject, ObservableObject {
 
         sessionQueue.async { [weak self] in
             guard let self = self, !self.isRecordingInternal else { return }
-            do {
-                let all = self.compressedVideoBuffer?.snapshot() ?? []
-                let valid = self.trimToKeyframe(all)
-                let audios = self.audioBuffer?.snapshot() ?? []
-                self.writer.begin(
-                    videoSamples: valid, audioSamples: audios,
-                    outputURL: self.makeURL(),
-                    mirrorVertical: self.mirrorVertical
-                )
-                self.isRecordingInternal = true
-                DispatchQueue.main.async {
-                    self.isRecording = true
-                    if self.shutterSoundEnabled { self.audioFeedback.sayStart() }
+            let all = self.compressedVideoBuffer?.snapshot() ?? []
+            let valid = self.trimToKeyframe(all)
+            let audios = self.audioBuffer?.snapshot() ?? []
+            self.writer.begin(
+                videoSamples: valid, audioSamples: audios,
+                outputURL: self.makeURL(),
+                mirrorVertical: self.mirrorVertical
+            ) { [weak self] success in
+                guard let self = self else { return }
+                if success {
+                    self.isRecordingInternal = true
+                    DispatchQueue.main.async {
+                        self.isRecording = true
+                        if self.shutterSoundEnabled { self.audioFeedback.sayStart() }
+                    }
+                } else {
+                    print("[startRecording] writer.begin 失败")
+                    DispatchQueue.main.async {
+                        self.lastSavedMessage = "录像启动失败"
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self.lastSavedMessage = nil }
+                    }
                 }
-            } catch {
-                print("[startRecording] error: \(error)")
             }
         }
     }
@@ -783,44 +786,50 @@ final class PreRecordWriter {
     private let queue = DispatchQueue(label: "com.fishingcamera.writer")
 
     func begin(videoSamples: [CMSampleBuffer], audioSamples: [CMSampleBuffer],
-               outputURL: URL, mirrorVertical: Bool) {
+               outputURL: URL, mirrorVertical: Bool, completion: @escaping (Bool) -> Void) {
         queue.async { [weak self] in
-            guard let self = self, !self.active else { return }
+            guard let self = self, !self.active else {
+                DispatchQueue.main.async { completion(false) }; return
+            }
             self.url = outputURL; self.appendedVideo = 0
+            var success = false
             do {
                 if FileManager.default.fileExists(atPath: outputURL.path) {
                     try? FileManager.default.removeItem(at: outputURL)
                 }
                 let w = try AVAssetWriter(outputURL: outputURL, fileType: .mp4)
 
-                // passthrough 必须提供 sourceFormatHint
                 var hint: CMFormatDescription? = nil
                 for s in videoSamples {
                     if let fd = CMSampleBufferGetFormatDescription(s) { hint = fd; break }
                 }
-                guard let vfd = hint else { print("[Writer] 无视频格式"); return }
+                guard let vfd = hint else {
+                    print("[Writer] 无视频格式")
+                    DispatchQueue.main.async { completion(false) }; return
+                }
                 let vIn = AVAssetWriterInput(mediaType: .video, outputSettings: nil, sourceFormatHint: vfd)
                 vIn.expectsMediaDataInRealTime = false
                 if mirrorVertical {
                     var t = CGAffineTransform.identity
-                    t = t.translatedBy(x: 0, y: 1)
-                    t = t.scaledBy(x: 1, y: -1)
+                    t = t.translatedBy(x: 0, y: 1); t = t.scaledBy(x: 1, y: -1)
                     vIn.transform = t
                 }
-                guard w.canAdd(vIn) else { return }
+                guard w.canAdd(vIn) else {
+                    DispatchQueue.main.async { completion(false) }; return
+                }
                 w.add(vIn)
 
-                // 音频只指定 AAC，采样率/声道跟随源
                 let aIn = AVAssetWriterInput(mediaType: .audio, outputSettings: [
-                    AVFormatIDKey: kAudioFormatMPEG4AAC,
-                    AVEncoderBitRateKey: 128000
+                    AVFormatIDKey: kAudioFormatMPEG4AAC, AVEncoderBitRateKey: 128000
                 ])
                 aIn.expectsMediaDataInRealTime = false
                 if w.canAdd(aIn) { w.add(aIn) }
 
-                guard w.startWriting() else { print("[Writer] startWriting fail"); return }
+                guard w.startWriting() else {
+                    print("[Writer] startWriting fail")
+                    DispatchQueue.main.async { completion(false) }; return
+                }
 
-                // 从首个关键帧开始
                 var v = videoSamples
                 if let ki = v.firstIndex(where: { isKeyFrame($0) }) { v = Array(v[ki...]) } else { v = [] }
                 let start: CMTime
@@ -850,8 +859,10 @@ final class PreRecordWriter {
                     }
                 }
                 self.writer = w; self.vInput = vIn; self.aInput = aIn; self.active = true
+                success = true
                 print("[Writer] begin v=\(v.count) a=\(a.count)")
             } catch { print("[Writer] \(error)") }
+            DispatchQueue.main.async { completion(success) }
         }
     }
 
