@@ -248,15 +248,19 @@ enum PreviewMode: String, CaseIterable {
     }
 }
 
-// MARK: - 音频反馈（暂时禁用声音，排查闪退）
+// MARK: - 音频反馈
 final class AudioFeedback {
     func sayStart() {
-        // 暂时禁用，排查是否声音导致闪退
+        AudioServicesPlaySystemSound(1104) // 快门叮声
+        AudioServicesPlaySystemSound(kSystemSoundID_Vibrate)
     }
     func sayStop() {
-        // 暂时禁用
+        AudioServicesPlaySystemSound(1104)
+        AudioServicesPlaySystemSound(kSystemSoundID_Vibrate)
     }
-    func sayInterrupted() {}
+    func sayInterrupted() {
+        AudioServicesPlaySystemSound(1104)
+    }
 }
 
 // MARK: - H.264 编码器
@@ -396,10 +400,9 @@ final class CameraEngine: NSObject, ObservableObject {
         }
         encoder.onEncodedSample = { [weak self] sb in
             guard let self = self else { return }
-            // 必须复制，VideoToolbox 回调返回后 sb 会被系统释放
-            var copy: CMSampleBuffer?
-            CMSampleBufferCreateCopy(allocator: kCFAllocatorDefault, sampleBuffer: sb, sampleBufferOut: &copy)
-            guard let copied = copy else { return }
+            // 深拷贝：VideoToolbox 回调返回后 sb 内部的 CMBlockBuffer 可能被释放
+            // 必须创建一个拥有独立内存的 CMBlockBuffer，再包装成新的 CMSampleBuffer
+            guard let copied = Self.deepCopyEncodedSample(sb) else { return }
             self.sessionQueue.async {
                 if self.preRecordOnInternal { self.compressedVideoBuffer?.write(copied) }
                 if self.isRecordingInternal { self.writer.appendVideo(copied) }
@@ -678,9 +681,8 @@ final class CameraEngine: NSObject, ObservableObject {
     // MARK: - 录制
     func startRecording() {
         guard !isRecordingInternal else { return }
-        // 暂时禁用声音和Timer，排查闪退
-        // suppressVoice(2.0)
-        // resetScreenOffTimer()
+        suppressVoice(2.0)
+        resetScreenOffTimer()
 
         sessionQueue.async { [weak self] in
             guard let self = self, !self.isRecordingInternal else { return }
@@ -697,7 +699,7 @@ final class CameraEngine: NSObject, ObservableObject {
                     self.isRecordingInternal = true
                     DispatchQueue.main.async {
                         self.isRecording = true
-                        // 暂时禁用声音
+                        if self.shutterSoundEnabled { self.audioFeedback.sayStart() }
                     }
                 } else {
                     print("[startRecording] writer.begin 失败")
@@ -721,8 +723,59 @@ final class CameraEngine: NSObject, ObservableObject {
         return samples
     }
 
+    /// 深拷贝 VideoToolbox 输出的 CMSampleBuffer，创建拥有独立内存的副本
+    /// 防止回调返回后内部 CMBlockBuffer 被系统回收导致悬垂指针
+    static func deepCopyEncodedSample(_ sb: CMSampleBuffer) -> CMSampleBuffer? {
+        // 先用系统方法复制（会 retain 内部 buffer）
+        var copy: CMSampleBuffer?
+        let st = CMSampleBufferCreateCopy(allocator: kCFAllocatorDefault, sampleBuffer: sb, sampleBufferOut: &copy)
+        guard st == noErr, let copied = copy else { return nil }
+
+        // 获取原始 data buffer
+        guard let origBuf = CMSampleBufferGetDataBuffer(sb) else {
+            // 没有 data buffer（可能是 image buffer），直接返回系统复制的版本
+            return copied
+        }
+
+        let totalLen = CMBlockBufferGetDataLength(origBuf)
+        guard totalLen > 0 else { return copied }
+
+        // 创建独立内存块并复制数据
+        let mem = malloc(totalLen)
+        guard let mem = mem else { return copied }
+        var ptr: UnsafeMutablePointer<Int8>?
+        var lenAtOff = 0, total = 0
+        let gp = CMBlockBufferGetDataPointer(origBuf, atOffset: 0,
+                                             lengthAtOffsetOut: &lenAtOff,
+                                             totalLengthOut: &total,
+                                             dataPointerOut: &ptr)
+        guard gp == noErr, let p = ptr else { free(mem); return copied }
+        memcpy(mem, p, total)
+
+        // 用独立内存创建新的 CMBlockBuffer
+        var newBuf: CMBlockBuffer?
+        let cs = CMBlockBufferCreateWithMemoryBlock(
+            allocator: kCFAllocatorDefault,
+            memoryBlock: mem,
+            blockLength: total,
+            blockAllocator: kCFAllocatorDefault,
+            customBlockSource: nil,
+            offsetToData: 0,
+            dataLength: total,
+            flags: 0,
+            blockBufferOut: &newBuf)
+        guard cs == noErr, let nb = newBuf else { free(mem); return copied }
+
+        // 用新的 block buffer 替换 sample buffer 里的 data buffer
+        CMSampleBufferSetDataBuffer(copied, nb)
+        return copied
+    }
+
     func stopRecording() {
         guard isRecordingInternal else { return }
+        if shutterSoundEnabled { audioFeedback.sayStop() }
+        suppressVoice(2.0)
+        resetScreenOffTimer()
         sessionQueue.async { [weak self] in
             guard let self = self, self.isRecordingInternal else { return }
             self.writer.end()
@@ -758,10 +811,8 @@ extension CameraEngine: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureA
             }
             encoder.encode(pixelBuffer: pb, presentationTime: pts, forceKeyframe: isRecordingInternal)
         } else if output === audioOutput {
-            // 音频帧也要复制，回调返回后会被释放
-            var aCopy: CMSampleBuffer?
-            CMSampleBufferCreateCopy(allocator: kCFAllocatorDefault, sampleBuffer: sb, sampleBufferOut: &aCopy)
-            if let aCopy = aCopy {
+            // 音频帧深拷贝，防止回调返回后被释放
+            if let aCopy = Self.deepCopyEncodedSample(sb) {
                 if preRecordOnInternal, var b = audioBuffer { b.write(aCopy) }
                 if isRecordingInternal { writer.appendAudio(aCopy) }
             }
