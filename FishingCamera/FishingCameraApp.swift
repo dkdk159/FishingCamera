@@ -469,7 +469,6 @@ final class CameraEngine: NSObject, ObservableObject {
             if self.captureSession.canAddOutput(self.audioOutput) { self.captureSession.addOutput(self.audioOutput) }
 
             // 添加 AVCaptureMovieFileOutput 用于稳定录制
-            self.movieFileOutput.delegate = self
             if self.captureSession.canAddOutput(self.movieFileOutput) {
                 self.captureSession.addOutput(self.movieFileOutput)
             }
@@ -814,7 +813,7 @@ extension CameraEngine: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureA
 }
 
 // MARK: - AVCaptureFileOutputRecordingDelegate
-extension CameraEngine: AVCaptureFileOutputRecordingDelegate, AVCaptureFileOutputDelegate {
+extension CameraEngine: AVCaptureFileOutputRecordingDelegate {
     func fileOutput(_ output: AVCaptureFileOutput, didStartRecordingTo fileURL: URL, from connections: [AVCaptureConnection]) {
         print("[MovieOutput] didStartRecordingTo \(fileURL.lastPathComponent)")
         DispatchQueue.main.async { [weak self] in
