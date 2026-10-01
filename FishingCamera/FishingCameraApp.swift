@@ -275,19 +275,11 @@ final class H264VideoEncoder {
             session = nil
             VTCompressionSessionInvalidate(old)
         }
-        var spec: CFDictionary? = nil
-        if #available(iOS 17.4, *) {
-            spec = [kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder as String: true] as CFDictionary
-        }
-        // 明确指定 NV12 输入格式，匹配相机输出
-        let attrs: [String: Any] = [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
-        ]
         var ns: VTCompressionSession?
         let st = VTCompressionSessionCreate(
             allocator: kCFAllocatorDefault, width: Int32(width), height: Int32(height),
-            codecType: kCMVideoCodecType_H264, encoderSpecification: spec,
-            imageBufferAttributes: attrs as CFDictionary, compressedDataAllocator: nil,
+            codecType: kCMVideoCodecType_H264, encoderSpecification: nil,
+            imageBufferAttributes: nil, compressedDataAllocator: nil,
             outputCallback: { refcon, _, status, _, sb in
                 guard status == noErr, let s = sb, let r = refcon else { return }
                 Unmanaged<H264VideoEncoder>.fromOpaque(r).takeUnretainedValue().onEncodedSample?(s)
@@ -299,9 +291,9 @@ final class H264VideoEncoder {
             return
         }
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
-        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AverageBitRate, value: bitrate as CFNumber)
+        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AverageBitRate, value: NSNumber(value: bitrate))
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_High_AutoLevel)
-        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: (fps * 2) as CFNumber)
+        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: NSNumber(value: fps * 2))
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
         VTCompressionSessionPrepareToEncodeFrames(s)
         session = s
@@ -828,11 +820,23 @@ final class PreRecordWriter {
                 }
                 w.add(vIn)
 
-                let aIn = AVAssetWriterInput(mediaType: .audio, outputSettings: [
-                    AVFormatIDKey: kAudioFormatMPEG4AAC, AVEncoderBitRateKey: 128000
-                ])
-                aIn.expectsMediaDataInRealTime = false
-                if w.canAdd(aIn) { w.add(aIn) }
+                // 音频：从首帧获取格式描述作为 sourceFormatHint
+                var aHint: CMFormatDescription? = nil
+                for s in audioSamples {
+                    if let fd = CMSampleBufferGetFormatDescription(s) { aHint = fd; break }
+                }
+                let aIn: AVAssetWriterInput?
+                if let afd = aHint {
+                    aIn = AVAssetWriterInput(mediaType: .audio, outputSettings: [
+                        AVFormatIDKey: kAudioFormatMPEG4AAC, AVEncoderBitRateKey: 128000
+                    ], sourceFormatHint: afd)
+                } else {
+                    aIn = AVAssetWriterInput(mediaType: .audio, outputSettings: [
+                        AVFormatIDKey: kAudioFormatMPEG4AAC, AVEncoderBitRateKey: 128000
+                    ])
+                }
+                aIn?.expectsMediaDataInRealTime = false
+                if let aIn = aIn, w.canAdd(aIn) { w.add(aIn) }
 
                 guard w.startWriting() else {
                     print("[Writer] startWriting fail")
