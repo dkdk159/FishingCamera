@@ -407,8 +407,13 @@ final class MovieWriter {
     private func writeBulk(video: [CMSampleBuffer], audio: [CMSampleBuffer]) {
         guard let vIn = videoInput else { return }
         var vi = 0, ai = 0
-        let deadline = Date().addingTimeInterval(20)
+        let deadline = Date().addingTimeInterval(10)
         while (vi < video.count || ai < audio.count) && Date() < deadline {
+            // 写入器一旦失败立即中止，绝不空等（否则会阻塞整个写入队列，导致后续点击无反应）
+            if let w = writer, w.status != .writing {
+                Log.write("[Writer] 批量写入中止 status=\(w.status.rawValue) \(w.error?.localizedDescription ?? "")")
+                break
+            }
             let takeVideo: Bool
             if ai >= audio.count { takeVideo = true }
             else if vi >= video.count { takeVideo = false }
@@ -484,6 +489,18 @@ final class MovieWriter {
                 let ok = (w.status == .completed)
                 Log.write("[Writer] 完成 ok=\(ok) status=\(w.status.rawValue) 帧=\(frames) \(w.error?.localizedDescription ?? "")")
                 DispatchQueue.main.async { completion(ok ? url : nil) }
+            }
+            self.cleanup()
+        }
+    }
+
+    /// 强制中止当前写入（启动超时/异常兜底），保证写入队列不会被卡死
+    func cancel() {
+        queue.async { [weak self] in
+            guard let self = self else { return }
+            if self.active {
+                Log.write("[Writer] 强制中止")
+                self.writer?.cancelWriting()
             }
             self.cleanup()
         }
@@ -737,6 +754,7 @@ final class CameraEngine: NSObject, ObservableObject {
     private var screenOffTimer: Timer?
     private var recordTimer: Timer?
     private var logTimer: Timer?
+    private var startWatchdog: Timer?
 
     private var recordingFlag: Bool { stateLock.lock(); defer { stateLock.unlock() }; return _recording }
     private var preRecordFlag: Bool { stateLock.lock(); defer { stateLock.unlock() }; return _preRecordFlag }
@@ -747,10 +765,28 @@ final class CameraEngine: NSObject, ObservableObject {
     private func resetRecordingState() {
         stateLock.lock(); _recording = false; _starting = false; _live = false; _pending = false; stateLock.unlock()
         DispatchQueue.main.async {
+            self.disarmStartWatchdog()
             self.isRecording = false
             self.stopRecordTimer()
         }
     }
+
+    /// 启动看门狗：3 秒内没真正进入写入状态就中止并复位，避免永久卡在"点了没反应"
+    private func armStartWatchdog() {
+        disarmStartWatchdog()
+        startWatchdog = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: false) { [weak self] _ in
+            guard let self = self else { return }
+            self.stateLock.lock()
+            let stuck = self._starting || (self._recording && !self._live)
+            self.stateLock.unlock()
+            guard stuck else { return }
+            Log.write("[Record] 启动超时(3秒)：未进入写入状态，已复位")
+            self.writer.cancel()
+            self.resetRecordingState()
+            self.showStatus("录像启动失败：无画面")
+        }
+    }
+    private func disarmStartWatchdog() { startWatchdog?.invalidate(); startWatchdog = nil }
 
     // MARK: 生命周期
     func prepare() {
@@ -943,20 +979,22 @@ final class CameraEngine: NSObject, ObservableObject {
 
     private func handleEncoded(_ sb: CMSampleBuffer) {
         encodedFrameCount += 1
-        if preRecordFlag { videoRing?.append(sb) }
+        // 深拷贝：编码回调返回后原 buffer 内存会被回收，必须持有独立副本
+        guard let frame = sb.deepCopy() else { return }
+        if preRecordFlag { videoRing?.append(frame) }
         // 缓冲为空时按下录制：等第一个关键帧再建 writer。
         // 必须先于 recordingFlag 判断，否则 writer 永远建不起来（假录制）
         if pendingFlag {
-            guard sb.isKeyFrame else { return }
+            guard frame.isKeyFrame else { return }
             clearPending()
-            let startPTS = CMSampleBufferGetPresentationTimeStamp(sb)
+            let startPTS = CMSampleBufferGetPresentationTimeStamp(frame)
             let a = (audioRing?.snapshot() ?? []).filter {
                 CMTimeCompare(CMSampleBufferGetPresentationTimeStamp($0), startPTS) >= 0
             }
-            startWriter(video: [sb], audio: a)
+            startWriter(video: [frame], audio: a)
             return
         }
-        if recordingFlag { writer.appendVideo(sb) }
+        if recordingFlag { writer.appendVideo(frame) }
     }
 
     /// 统一启动写入器；失败时复位录制状态，避免卡死
@@ -979,6 +1017,7 @@ final class CameraEngine: NSObject, ObservableObject {
             let stillWanted = self._recording
             if ok && stillWanted { self._live = true }
             self.stateLock.unlock()
+            self.disarmStartWatchdog()
             Log.write("[Record] writer 启动 ok=\(ok) v=\(video.count) a=\(audio.count)")
             if !ok && stillWanted { self.resetRecordingState(); self.showStatus("录像启动失败") }
         }
@@ -994,6 +1033,7 @@ final class CameraEngine: NSObject, ObservableObject {
         stateLock.unlock()
 
         resetScreenOffTimer()
+        armStartWatchdog()
         if shutterSound { sound.playStart() }
         if flashReminder { flash() }
 
@@ -1037,6 +1077,7 @@ final class CameraEngine: NSObject, ObservableObject {
 
         if shutterSound { sound.playStop() }
         DispatchQueue.main.async {
+            self.disarmStartWatchdog()
             self.isRecording = false
             self.stopRecordTimer()
         }
@@ -1203,9 +1244,11 @@ extension CameraEngine: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureA
     }
 
     private func handleAudio(_ sb: CMSampleBuffer) {
-        if preRecordFlag { audioRing?.append(sb) }
-        if recordingFlag { writer.appendAudio(sb) }
         if voiceFlag { voice.feed(sb) }
+        // 深拷贝：采集回调返回后原 buffer 内存会被回收，必须持有独立副本
+        guard let a = sb.deepCopy() else { return }
+        if preRecordFlag { audioRing?.append(a) }
+        if recordingFlag { writer.appendAudio(a) }
     }
 }
 
@@ -1216,6 +1259,39 @@ extension CMSampleBuffer {
               let a = arr.first else { return true }
         return !(a[kCMSampleAttachmentKey_NotSync] as? Bool ?? false)
     }
+
+    /// 深拷贝：创建拥有独立内存的副本。
+    /// 关键！采集/编码回调返回后，sampleBuffer 内部 buffer 会被系统回收，
+    /// 若直接存入预录环形缓冲、之后再交给 AVAssetWriter，会变成悬垂指针 →
+    /// 写入器状态变 .failed（录不出文件/保存失败）甚至崩溃。
+    func deepCopy() -> CMSampleBuffer? {
+        var copy: CMSampleBuffer?
+        let st = CMSampleBufferCreateCopy(allocator: kCFAllocatorDefault, sampleBuffer: self, sampleBufferOut: &copy)
+        guard st == noErr, let copied = copy else { return nil }
+        guard let orig = CMSampleBufferGetDataBuffer(self) else { return copied }
+        let total = CMBlockBufferGetDataLength(orig)
+        guard total > 0 else { return copied }
+        guard let mem = malloc(total) else { return copied }
+        var atOffset = 0, length = 0
+        var ptr: UnsafeMutablePointer<Int8>?
+        let gp = CMBlockBufferGetDataPointer(orig, atOffset: 0,
+                                             lengthAtOffsetOut: &atOffset,
+                                             totalLengthOut: &length,
+                                             dataPointerOut: &ptr)
+        // 只处理连续内存（采集/编码出来的 buffer 都是单块）
+        guard gp == noErr, let p = ptr, length == total else { free(mem); return copied }
+        memcpy(mem, p, total)
+        var newBuf: CMBlockBuffer?
+        let cs = CMBlockBufferCreateWithMemoryBlock(allocator: kCFAllocatorDefault,
+                                                    memoryBlock: mem, blockLength: total,
+                                                    blockAllocator: kCFAllocatorDefault,
+                                                    customBlockSource: nil, offsetToData: 0,
+                                                    dataLength: total, flags: 0, blockBufferOut: &newBuf)
+        guard cs == noErr, let nb = newBuf else { free(mem); return copied }
+        CMSampleBufferSetDataBuffer(copied, newValue: nb)
+        return copied
+    }
+
     func toPCMBuffer() -> AVAudioPCMBuffer? {
         guard let fmt = CMSampleBufferGetFormatDescription(self),
               let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fmt) else { return nil }
