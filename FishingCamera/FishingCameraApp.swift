@@ -801,13 +801,12 @@ private let videoEncoder = H264VideoEncoder()
 extension CameraEngine: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate {
     func captureOutput(_ output: AVCaptureOutput, didOutput sb: CMSampleBuffer, from conn: AVCaptureConnection) {
         if output === videoOutput {
-            let needEncode = preRecordOnInternal || isRecordingInternal
-            guard needEncode, let pb = CMSampleBufferGetImageBuffer(sb) else { return }
+            guard let pb = CMSampleBufferGetImageBuffer(sb) else { return }
             let w = Int32(CVPixelBufferGetWidth(pb)), h = Int32(CVPixelBufferGetHeight(pb))
-            // 帧尺寸变化（切换分辨率）时重建编码器并清空预录缓冲，保证格式一致
+            // 首次或分辨率变化：初始化预录缓冲与编码器，即使当前未开启预录/录制
+            // （需放在 needEncode 判断之前，否则初始 preRecordOnInternal=false 会直接 return，导致预录永不初始化）
             if w != encoderWidth || h != encoderHeight {
                 encoderWidth = w; encoderHeight = h
-                compressedVideoBuffer = nil
                 rebuildBuffers()
                 let dstSize = (w % 2 == 0) ? Int(w) : Int(w) + 1
                 let dstH = (h % 2 == 0) ? Int(h) : Int(h) + 1
@@ -815,6 +814,9 @@ extension CameraEngine: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureA
                 videoEncoder.setup(width: dstSize, height: dstH,
                                    fps: max(frameRate.rawValue, 15), bitrate: bitrate)
             }
+            // 仅当需要（预录开启或正在录制）时才编码写入缓冲
+            let needEncode = preRecordOnInternal || isRecordingInternal
+            guard needEncode else { return }
             // 输入未压缩帧，编码器回调产出 H.264 压缩帧
             // 每 30 帧强制一个关键帧，并保证第 0 帧是关键帧，确保预录缓冲可对齐解码
             let pts = CMSampleBufferGetPresentationTimeStamp(sb)
