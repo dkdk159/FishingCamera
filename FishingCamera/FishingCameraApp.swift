@@ -1,4 +1,4 @@
-import SwiftUI
+﻿import SwiftUI
 import AVFoundation
 import Photos
 import CoreMotion
@@ -248,24 +248,27 @@ final class H264VideoEncoder {
             VTCompressionSessionCompleteFrames(old, untilPresentationTimeStamp: .invalid)
             VTCompressionSessionInvalidate(old); session = nil
         }
-        let spec: [String: Any] = [kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder as String: true]
+        var spec: CFDictionary? = nil
+        if #available(iOS 17.4, *) {
+            spec = [kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder as String: true] as CFDictionary
+        }
         var ns: VTCompressionSession?
         let st = VTCompressionSessionCreate(
             allocator: kCFAllocatorDefault, width: Int32(width), height: Int32(height),
-            codecType: kCMVideoCodecType_H264, encoderSpecification: spec as CFDictionary,
+            codecType: kCMVideoCodecType_H264, encoderSpecification: spec,
             imageBufferAttributes: nil, compressedDataAllocator: nil,
             outputCallback: { refcon, _, status, _, sb in
                 guard status == noErr, let s = sb, let r = refcon else { return }
                 Unmanaged<H264VideoEncoder>.fromOpaque(r).takeUnretainedValue().onEncodedSample?(s)
             },
-            outputCallbackRefCon: Unmanaged.passUnretained(self).toOpaque(),
+            refcon: Unmanaged.passUnretained(self).toOpaque(),
             compressionSessionOut: &ns)
         guard st == noErr, let s = ns else { return }
-        VTSessionSetProperty(s, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue)
-        VTSessionSetProperty(s, kVTCompressionPropertyKey_AverageBitRate, bitrate as CFNumber)
-        VTSessionSetProperty(s, kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_H264_High_AutoLevel)
-        VTSessionSetProperty(s, kVTCompressionPropertyKey_MaxKeyFrameInterval, (fps * 2) as CFNumber)
-        VTSessionSetProperty(s, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse)
+        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
+        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AverageBitRate, value: bitrate as CFNumber)
+        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_High_AutoLevel)
+        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: (fps * 2) as CFNumber)
+        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
         VTCompressionSessionPrepareToEncodeFrames(s)
         session = s
     }
@@ -279,7 +282,7 @@ final class H264VideoEncoder {
             session, imageBuffer: pixelBuffer,
             presentationTimeStamp: presentationTime, duration: .invalid,
             frameProperties: props.isEmpty ? nil : props as CFDictionary,
-            sourceFrameRefCon: nil, infoFlagsOut: nil)
+            sourceFrameRefcon: nil, infoFlagsOut: nil)
     }
 
     deinit {
@@ -644,7 +647,7 @@ final class CameraEngine: NSObject, ObservableObject {
         if shutterSoundEnabled {
             audioFeedback.sayStart()
         }
-        suppressVoice(seconds: 2.0)
+        suppressVoice(2.0)
         resetScreenOffTimer()
 
         sessionQueue.async { [weak self] in
@@ -680,7 +683,7 @@ final class CameraEngine: NSObject, ObservableObject {
     func stopRecording() {
         guard isRecordingInternal else { return }
         if shutterSoundEnabled { audioFeedback.sayStop() }
-        suppressVoice(seconds: 2.0)
+        suppressVoice(2.0)
         resetScreenOffTimer()
         sessionQueue.async { [weak self] in
             guard let self = self, self.isRecordingInternal else { return }
@@ -709,7 +712,7 @@ extension CameraEngine: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureA
             let pts = CMSampleBufferGetPresentationTimeStamp(sb)
             encoder.encode(pixelBuffer: pb, presentationTime: pts, forceKeyframe: isRecordingInternal)
         } else if output === audioOutput {
-            if preRecordOnInternal, let b = audioBuffer { b.write(sb) }
+            if preRecordOnInternal, var b = audioBuffer { b.write(sb) }
             if isRecordingInternal { writer.appendAudio(sb) }
             voiceManager.feedAudio(sb)
         }
@@ -724,83 +727,123 @@ final class PreRecordWriter {
     private var active = false
     private var url: URL?
     private var appendedVideo = 0
+    private let queue = DispatchQueue(label: "com.fishingcamera.writer")
 
     func begin(videoSamples: [CMSampleBuffer], audioSamples: [CMSampleBuffer],
                outputURL: URL, mirrorVertical: Bool) {
-        guard !active else { return }
-        url = outputURL; appendedVideo = 0
-        do {
-            writer = try AVAssetWriter(outputURL: outputURL, fileType: .mp4)
-            vInput = AVAssetWriterInput(mediaType: .video, outputSettings: nil)
-            vInput?.expectsMediaDataInRealTime = false
-            if mirrorVertical {
-                var t = CGAffineTransform.identity
-                t = t.translatedBy(x: 0, y: 1)
-                t = t.scaledBy(x: 1, y: -1)
-                vInput?.transform = t
-            }
-            let aS: [String: Any] = [
-                AVFormatIDKey: kAudioFormatMPEG4AAC,
-                AVNumberOfChannelsKey: 1,
-                AVSampleRateKey: 44100,
-                AVEncoderBitRateKey: 128000
-            ]
-            aInput = AVAssetWriterInput(mediaType: .audio, outputSettings: aS)
-            aInput?.expectsMediaDataInRealTime = true
-            if let v = vInput, writer!.canAdd(v) { writer!.add(v) }
-            if let a = aInput, writer!.canAdd(a) { writer!.add(a) }
-            guard writer!.startWriting() else { cleanup(); return }
-            var startTime = CMTime.zero
-            var hasStart = false
-            if let fv = videoSamples.first {
-                startTime = CMSampleBufferGetPresentationTimeStamp(fv); hasStart = true
-            }
-            if let fa = audioSamples.first {
-                let a = CMSampleBufferGetPresentationTimeStamp(fa)
-                if !hasStart || CMTimeCompare(a, startTime) < 0 { startTime = a }
-                hasStart = true
-            }
-            writer?.startSession(atSourceTime: hasStart ? startTime : .zero)
-            active = true
-            let mx = max(videoSamples.count, audioSamples.count)
-            for i in 0..<mx {
-                if i < videoSamples.count {
-                    let s = videoSamples[i]
-                    if CMTimeCompare(CMSampleBufferGetPresentationTimeStamp(s), startTime) >= 0 { appendVideo(s) }
+        queue.async { [weak self] in
+            guard let self = self, !self.active else { return }
+            self.url = outputURL; self.appendedVideo = 0
+            do {
+                if FileManager.default.fileExists(atPath: outputURL.path) {
+                    try? FileManager.default.removeItem(at: outputURL)
                 }
-                if i < audioSamples.count {
-                    let s = audioSamples[i]
-                    if CMTimeCompare(CMSampleBufferGetPresentationTimeStamp(s), startTime) >= 0 { appendAudio(s) }
+                let w = try AVAssetWriter(outputURL: outputURL, fileType: .mp4)
+
+                // passthrough 必须提供 sourceFormatHint
+                var hint: CMFormatDescription? = nil
+                for s in videoSamples {
+                    if let fd = CMSampleBufferGetFormatDescription(s) { hint = fd; break }
                 }
-            }
-        } catch { print("[Writer] \(error)"); cleanup() }
+                guard let vfd = hint else { print("[Writer] 无视频格式"); return }
+                let vIn = AVAssetWriterInput(mediaType: .video, outputSettings: nil, sourceFormatHint: vfd)
+                vIn.expectsMediaDataInRealTime = false
+                if mirrorVertical {
+                    var t = CGAffineTransform.identity
+                    t = t.translatedBy(x: 0, y: 1)
+                    t = t.scaledBy(x: 1, y: -1)
+                    vIn.transform = t
+                }
+                guard w.canAdd(vIn) else { return }
+                w.add(vIn)
+
+                // 音频只指定 AAC，采样率/声道跟随源
+                let aIn = AVAssetWriterInput(mediaType: .audio, outputSettings: [
+                    AVFormatIDKey: kAudioFormatMPEG4AAC,
+                    AVEncoderBitRateKey: 128000
+                ])
+                aIn.expectsMediaDataInRealTime = false
+                if w.canAdd(aIn) { w.add(aIn) }
+
+                guard w.startWriting() else { print("[Writer] startWriting fail"); return }
+
+                // 从首个关键帧开始
+                var v = videoSamples
+                if let ki = v.firstIndex(where: { isKeyFrame($0) }) { v = Array(v[ki...]) } else { v = [] }
+                let start: CMTime
+                if let f = v.first { start = CMSampleBufferGetPresentationTimeStamp(f) }
+                else if let f = audioSamples.first { start = CMSampleBufferGetPresentationTimeStamp(f) }
+                else { start = .zero }
+                w.startSession(atSourceTime: start)
+
+                let a = audioSamples.filter {
+                    CMTimeCompare(CMSampleBufferGetPresentationTimeStamp($0), start) >= 0
+                }
+                var vi = 0, ai = 0
+                while vi < v.count || ai < a.count {
+                    let takeV: Bool
+                    if ai >= a.count { takeV = true }
+                    else if vi >= v.count { takeV = false }
+                    else {
+                        takeV = CMTimeCompare(CMSampleBufferGetPresentationTimeStamp(v[vi]),
+                                               CMSampleBufferGetPresentationTimeStamp(a[ai])) <= 0
+                    }
+                    if takeV {
+                        if vIn.isReadyForMoreMediaData, vIn.append(v[vi]) { self.appendedVideo += 1 }
+                        vi += 1
+                    } else {
+                        if aIn.isReadyForMoreMediaData { _ = aIn.append(a[ai]) }
+                        ai += 1
+                    }
+                }
+                self.writer = w; self.vInput = vIn; self.aInput = aIn; self.active = true
+                print("[Writer] begin v=\(v.count) a=\(a.count)")
+            } catch { print("[Writer] \(error)") }
+        }
     }
 
     func appendVideo(_ s: CMSampleBuffer) {
-        guard active, let i = vInput, i.isReadyForMoreMediaData else { return }
-        if i.append(s) { appendedVideo += 1 }
+        queue.async { [weak self] in
+            guard let self = self, self.active,
+                  let i = self.vInput, let w = self.writer, w.status == .writing else { return }
+            if i.isReadyForMoreMediaData, i.append(s) { self.appendedVideo += 1 }
+        }
     }
     func appendAudio(_ s: CMSampleBuffer) {
-        guard active, let i = aInput, i.isReadyForMoreMediaData else { return }
-        _ = i.append(s)
+        queue.async { [weak self] in
+            guard let self = self, self.active,
+                  let i = self.aInput, let w = self.writer, w.status == .writing else { return }
+            if i.isReadyForMoreMediaData { _ = i.append(s) }
+        }
     }
 
     func end() {
-        guard active, let w = writer else { cleanup(); return }
-        guard w.status == .writing, appendedVideo > 0 else {
-            w.cancelWriting(); cleanup(); return
-        }
-        vInput?.markAsFinished(); aInput?.markAsFinished()
-        let u = url; let ref = w
-        writer = nil; vInput = nil; aInput = nil; active = false; url = nil
-        ref.finishWriting {
-            if ref.status == .completed, let u = u { PhotoLibrarySaver.save(u) }
+        queue.async { [weak self] in
+            guard let self = self, self.active, let w = self.writer else { return }
+            guard w.status == .writing, self.appendedVideo > 0 else {
+                if w.status == .writing { w.cancelWriting() }
+                self.cleanup(); return
+            }
+            self.active = false
+            self.vInput?.markAsFinished(); self.aInput?.markAsFinished()
+            let u = self.url; let ref = w
+            self.vInput = nil; self.aInput = nil; self.writer = nil; self.url = nil
+            ref.finishWriting {
+                if ref.status == .completed, let u = u { PhotoLibrarySaver.save(u) }
+                else if let e = ref.error { print("[Writer] finish error: \(e)") }
+            }
         }
     }
     private func cleanup() {
         writer = nil; vInput = nil; aInput = nil
         active = false; url = nil; appendedVideo = 0
     }
+}
+
+private func isKeyFrame(_ sb: CMSampleBuffer) -> Bool {
+    guard let arr = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: false)
+        as? [[CFString: Any]], let a = arr.first else { return true }
+    return !(a[kCMSampleAttachmentKey_NotSync] as? Bool ?? false)
 }
 
 enum PhotoLibrarySaver {
@@ -963,10 +1006,20 @@ private struct VolumeBtn: UIViewRepresentable {
     let action: () -> Void
     func makeUIView(context: Context) -> UIView {
         let v = UIView(); v.isUserInteractionEnabled = false
-        let i = AVCaptureEventInteraction { e in
-            if e.phase == .ended { DispatchQueue.main.async { action() } }
+        if let cls = NSClassFromString("AVCaptureEventInteraction") as? NSObject.Type {
+            let sel = NSSelectorFromString("initWithHandler:")
+            if cls.responds(to: sel) {
+                let handler: @convention(block) (AnyObject) -> Void = { e in
+                    if let phase = e.value(forKey: "phase") as? Int, phase == 2 {
+                        DispatchQueue.main.async { action() }
+                    }
+                }
+                if let interaction = cls.perform(sel, with: handler)?.takeUnretainedValue() as? UIInteraction {
+                    v.addInteraction(interaction)
+                }
+            }
         }
-        v.addInteraction(i); return v
+        return v
     }
     func updateUIView(_ uiView: UIView, context: Context) {}
 }
@@ -1054,7 +1107,7 @@ struct LevelOverlay: View {
             }
             Text(String(format: "%.1f°", motion.roll * 180 / .pi))
                 .font(Design.mono(10))
-                .foregroundStyle(.white)
+                .foregroundColor(.white)
                 .padding(.horizontal, 6).padding(.vertical, 2)
                 .background(Design.glassBg)
                 .clipShape(Capsule())
@@ -1070,7 +1123,7 @@ struct GlassPill: View {
     var body: some View {
         Text(text)
             .font(Design.mono(11))
-            .foregroundStyle(color)
+            .foregroundColor(color)
             .padding(.horizontal, 10)
             .padding(.vertical, 5)
             .background(Design.glassBg)
@@ -1090,7 +1143,7 @@ struct GlassCircleButton: View {
         Button(action: action) {
             Image(systemName: icon)
                 .font(.system(size: size * 0.4, weight: .semibold))
-                .foregroundStyle(active ? Design.accent : .white)
+                .foregroundColor(active ? Design.accent : .white)
                 .frame(width: size, height: size)
                 .background(
                     Circle()
@@ -1172,7 +1225,7 @@ struct CameraScreen: View {
                     Spacer()
                     Text(msg)
                         .font(Design.body(13))
-                        .foregroundStyle(.white)
+                        .foregroundColor(.white)
                         .padding(.horizontal, 16)
                         .padding(.vertical, 10)
                         .background(Design.glassBg)
@@ -1207,7 +1260,7 @@ struct CameraScreen: View {
                     .shadow(color: engine.isRecording ? Design.recordRed : .clear, radius: 4)
                 Text(engine.isRecording ? "REC" : "STBY")
                     .font(Design.mono(11))
-                    .foregroundStyle(engine.isRecording ? Design.recordRed : .white)
+                    .foregroundColor(engine.isRecording ? Design.recordRed : .white)
             }
             .padding(.horizontal, 10).padding(.vertical, 6)
             .background(Design.glassBg)
@@ -1229,7 +1282,7 @@ struct CameraScreen: View {
                 Text("\(Int(engine.batteryLevel * 100))%")
                     .font(Design.mono(11))
             }
-            .foregroundStyle(engine.batteryLevel < 0.2 ? Design.recordRed : .white)
+            .foregroundColor(engine.batteryLevel < 0.2 ? Design.recordRed : .white)
             .padding(.horizontal, 10).padding(.vertical, 6)
             .background(Design.glassBg)
             .clipShape(Capsule())
@@ -1306,10 +1359,10 @@ struct CameraScreen: View {
                     VStack(spacing: 10) {
                         Image(systemName: "chevron.up")
                             .font(.system(size: 26, weight: .bold))
-                            .foregroundStyle(.white.opacity(0.35))
+                            .foregroundColor(.white.opacity(0.35))
                         Text("上滑解锁")
                             .font(Design.body(12))
-                            .foregroundStyle(.white.opacity(0.35))
+                            .foregroundColor(.white.opacity(0.35))
                     }
                     .padding(.bottom, 70)
                     .offset(y: dragOffset)
@@ -1528,7 +1581,7 @@ struct SettingsView: View {
                     Button { dismiss.wrappedValue.dismiss() } label: {
                         Image(systemName: "chevron.left")
                             .font(.system(size: 16, weight: .semibold))
-                            .foregroundStyle(.white)
+                            .foregroundColor(.white)
                     }
                 }
             }
@@ -1543,10 +1596,10 @@ struct SettingsView: View {
             HStack(spacing: 8) {
                 Image(systemName: icon)
                     .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(Design.accent)
+                    .foregroundColor(Design.accent)
                 Text(title)
                     .font(Design.title(14))
-                    .foregroundStyle(.white)
+                    .foregroundColor(.white)
             }
             content()
         }
@@ -1579,9 +1632,8 @@ struct SettingsView: View {
     private func chip(title: String, selected: Bool, enabled: Bool = true, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Text(title)
-                .font(Design.body(13))
-                .fontWeight(selected ? .semibold : .regular)
-                .foregroundStyle(enabled ? (selected ? Design.accent : .white) : Color.white.opacity(0.3))
+                .font(.system(size: 13, weight: selected ? .semibold : .regular, design: .rounded))
+                .foregroundColor(enabled ? (selected ? Design.accent : .white) : Color.white.opacity(0.3))
                 .frame(maxWidth: .infinity)
                 .frame(height: 42)
                 .background(
@@ -1602,13 +1654,13 @@ struct SettingsView: View {
         HStack(spacing: 10) {
             Image(systemName: icon)
                 .font(.system(size: 13))
-                .foregroundStyle(Design.accent)
+                .foregroundColor(Design.accent)
             TextField(placeholder, text: text)
                 .font(Design.body(13))
-                .foregroundStyle(.white)
+                .foregroundColor(.white)
                 .textFieldStyle(PlainTextFieldStyle())
                 .autocorrectionDisabled(true)
-                .textInputAutocapitalization(.never)
+                .disableAutocapitalization()
         }
         .padding(.horizontal, 12)
         .frame(height: 44)
@@ -1620,5 +1672,16 @@ struct SettingsView: View {
                         .stroke(Color.white.opacity(0.06), lineWidth: 0.5)
                 )
         )
+    }
+}
+
+// MARK: - iOS 14 兼容：关闭自动大写
+extension View {
+    func disableAutocapitalization() -> some View {
+        if #available(iOS 15.0, *) {
+            return AnyView(self.textInputAutocapitalization(.never))
+        } else {
+            return AnyView(self)
+        }
     }
 }
