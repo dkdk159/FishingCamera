@@ -521,13 +521,13 @@ final class VoiceController: NSObject {
     private static func makePCMBuffer(from sampleBuffer: CMSampleBuffer) -> AVAudioPCMBuffer? {
         guard let desc = CMSampleBufferGetFormatDescription(sampleBuffer) else { return nil }
         let format = AVAudioFormat(cmAudioFormatDescription: desc)
-        let frames = CMSampleBufferGetNumSamples(sampleBuffer)
+        let frames = AVAudioFrameCount(CMSampleBufferGetNumSamples(sampleBuffer))
         guard frames > 0,
               let pcm = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames) else { return nil }
         pcm.frameLength = frames
         let abl = pcm.mutableAudioBufferList
         let status = CMSampleBufferCopyPCMDataIntoAudioBufferList(
-            sampleBuffer, at: 0, numFrames: Int32(frames), into: abl)
+            sampleBuffer, at: 0, frameCount: Int32(frames), into: abl)
         guard status == noErr else { return nil }
         return pcm
     }
