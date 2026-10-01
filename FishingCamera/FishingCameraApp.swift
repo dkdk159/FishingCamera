@@ -9,7 +9,22 @@ import CoreMotion
 import UIKit
 import Combine
 
-// MARK: - 调试日志（写入沙盒文档目录，便于排查）
+// MARK: - 调试日志（写入沙盒文档目录 + 内存缓冲供屏幕显示）
+enum LogBuffer {
+    private static let lock = NSLock()
+    private static var lines: [String] = []
+    static func add(_ s: String) {
+        lock.lock()
+        lines.append(s)
+        if lines.count > 8 { lines.removeFirst(lines.count - 8) }
+        lock.unlock()
+    }
+    static func text() -> String {
+        lock.lock(); defer { lock.unlock() }
+        return lines.joined(separator: "\n")
+    }
+}
+
 enum Log {
     private static var url: URL {
         let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
@@ -17,6 +32,7 @@ enum Log {
     }
     private static let queue = DispatchQueue(label: "com.fishing.camera.log")
     static func write(_ s: String) {
+        LogBuffer.add(s)
         queue.async {
             let line = "[\(Date())] \(s)\n"
             print(line, terminator: "")
@@ -96,6 +112,7 @@ enum StabilizationLevel: String, CaseIterable, Identifiable {
 
 enum PreRecordOption: String, CaseIterable, Identifiable {
     case off = "关闭"
+    case s5 = "5秒"
     case s10 = "10秒"
     case s30 = "30秒"
     case s60 = "1分钟"
@@ -104,6 +121,7 @@ enum PreRecordOption: String, CaseIterable, Identifiable {
     var seconds: Int {
         switch self {
         case .off: return 0
+        case .s5: return 5
         case .s10: return 10
         case .s30: return 30
         case .s60: return 60
@@ -314,15 +332,24 @@ final class MovieWriter {
     private var active = false
     private var videoAppended = 0
     private var outputURL: URL?
+    private var lastVideoPTS = CMTime.invalid
+    private var lastAudioPTS = CMTime.invalid
 
     func start(video: [CMSampleBuffer], audio: [CMSampleBuffer],
                url: URL, transform: CGAffineTransform?, completion: @escaping (Bool) -> Void) {
         queue.async { [weak self] in
-            guard let self = self, !self.active else { DispatchQueue.main.async { completion(false) }; return }
+            guard let self = self else { DispatchQueue.main.async { completion(false) }; return }
+            // 上一段若意外未收尾，直接取消，避免"第二次点不动/卡死"
+            if self.active {
+                Log.write("[Writer] 发现未收尾的上一段，强制取消")
+                self.writer?.cancelWriting()
+                self.cleanup()
+            }
             guard let first = video.first, let vHint = CMSampleBufferGetFormatDescription(first) else {
                 Log.write("[Writer] 无视频帧/格式，无法开始")
                 DispatchQueue.main.async { completion(false) }; return
             }
+            let startTime = CMSampleBufferGetPresentationTimeStamp(first)
             do {
                 if FileManager.default.fileExists(atPath: url.path) { try? FileManager.default.removeItem(at: url) }
                 let w = try AVAssetWriter(outputURL: url, fileType: .mp4)
@@ -330,34 +357,42 @@ final class MovieWriter {
                 let vIn = AVAssetWriterInput(mediaType: .video, outputSettings: nil, sourceFormatHint: vHint)
                 vIn.expectsMediaDataInRealTime = false
                 if let t = transform { vIn.transform = t }
-                guard w.canAdd(vIn) else { DispatchQueue.main.async { completion(false) }; return }
+                guard w.canAdd(vIn) else {
+                    Log.write("[Writer] 无法添加视频轨")
+                    DispatchQueue.main.async { completion(false) }; return
+                }
                 w.add(vIn)
 
+                // 预录音频只保留不早于视频起点的部分，避免 PTS 早于 startSession 被丢弃/写坏
+                let aValid = audio.filter { CMTimeCompare(CMSampleBufferGetPresentationTimeStamp($0), startTime) >= 0 }
                 let aSettings: [String: Any] = [AVFormatIDKey: kAudioFormatMPEG4AAC, AVEncoderBitRateKey: 128000]
                 let aIn = AVAssetWriterInput(mediaType: .audio, outputSettings: aSettings,
-                                             sourceFormatHint: audio.first.flatMap { CMSampleBufferGetFormatDescription($0) })
+                                             sourceFormatHint: aValid.first.flatMap { CMSampleBufferGetFormatDescription($0) })
                 aIn.expectsMediaDataInRealTime = false
                 let hasAudio = w.canAdd(aIn)
                 if hasAudio { w.add(aIn) }
 
                 guard w.startWriting() else {
-                    Log.write("[Writer] startWriting 失败")
+                    Log.write("[Writer] startWriting 失败 \(w.error?.localizedDescription ?? "")")
                     DispatchQueue.main.async { completion(false) }; return
                 }
-                w.startSession(atSourceTime: CMSampleBufferGetPresentationTimeStamp(first))
+                w.startSession(atSourceTime: startTime)
 
                 self.writer = w
                 self.videoInput = vIn
                 self.audioInput = hasAudio ? aIn : nil
                 self.outputURL = url
                 self.videoAppended = 0
+                self.lastVideoPTS = startTime
+                self.lastAudioPTS = .invalid
                 self.active = true
 
-                self.writeBulk(video: video, audio: audio)
-                Log.write("[Writer] 开始 预录v=\(video.count) a=\(audio.count) 音频=\(hasAudio)")
-                DispatchQueue.main.async { completion(true) }
+                self.writeBulk(video: video, audio: aValid)
+                Log.write("[Writer] 开始 预录v=\(video.count) a=\(aValid.count) 音频=\(hasAudio)")
+                DispatchQueue.main.async { completion(self.videoAppended > 0) }
             } catch {
                 Log.write("[Writer] 异常 \(error)")
+                self.cleanup()
                 DispatchQueue.main.async { completion(false) }
             }
         }
@@ -376,10 +411,13 @@ final class MovieWriter {
                                           CMSampleBufferGetPresentationTimeStamp(audio[ai])) <= 0
             }
             if takeVideo {
-                if vIn.append(video[vi]) { videoAppended += 1 }
+                let p = CMSampleBufferGetPresentationTimeStamp(video[vi])
+                if vIn.append(video[vi]) { videoAppended += 1; lastVideoPTS = p }
                 vi += 1
             } else if let aIn = audioInput {
-                _ = aIn.append(audio[ai]); ai += 1
+                let p = CMSampleBufferGetPresentationTimeStamp(audio[ai])
+                if aIn.append(audio[ai]) { lastAudioPTS = p }
+                ai += 1
             } else {
                 ai += 1
             }
@@ -390,6 +428,10 @@ final class MovieWriter {
         queue.async { [weak self] in
             guard let self = self, self.active, let vIn = self.videoInput,
                   let w = self.writer, w.status == .writing else { return }
+            let pts = CMSampleBufferGetPresentationTimeStamp(s)
+            // PTS 必须单调递增，否则 AVAssetWriter 会写入失败甚至抛异常
+            if self.lastVideoPTS.isValid && CMTimeCompare(pts, self.lastVideoPTS) <= 0 { return }
+            self.lastVideoPTS = pts
             if vIn.append(s) { self.videoAppended += 1 }
         }
     }
@@ -397,6 +439,9 @@ final class MovieWriter {
         queue.async { [weak self] in
             guard let self = self, self.active, let aIn = self.audioInput,
                   let w = self.writer, w.status == .writing else { return }
+            let pts = CMSampleBufferGetPresentationTimeStamp(s)
+            if self.lastAudioPTS.isValid && CMTimeCompare(pts, self.lastAudioPTS) <= 0 { return }
+            self.lastAudioPTS = pts
             _ = aIn.append(s)
         }
     }
@@ -407,8 +452,6 @@ final class MovieWriter {
                 DispatchQueue.main.async { completion(nil) }; return
             }
             self.active = false
-            self.videoInput?.markAsFinished()
-            self.audioInput?.markAsFinished()
             let url = self.outputURL
             if self.videoAppended == 0 {
                 Log.write("[Writer] 无有效帧，取消写入")
@@ -417,9 +460,12 @@ final class MovieWriter {
                 DispatchQueue.main.async { completion(nil) }
                 return
             }
+            self.videoInput?.markAsFinished()
+            self.audioInput?.markAsFinished()
+            let frames = self.videoAppended
             w.finishWriting {
                 let ok = (w.status == .completed)
-                Log.write("[Writer] 完成 ok=\(ok) status=\(w.status.rawValue)")
+                Log.write("[Writer] 完成 ok=\(ok) status=\(w.status.rawValue) 帧=\(frames)")
                 DispatchQueue.main.async { completion(ok ? url : nil) }
             }
             self.cleanup()
@@ -428,7 +474,8 @@ final class MovieWriter {
 
     private func cleanup() {
         writer = nil; videoInput = nil; audioInput = nil
-        outputURL = nil; videoAppended = 0
+        outputURL = nil; videoAppended = 0; active = false
+        lastVideoPTS = .invalid; lastAudioPTS = .invalid
     }
 }
 
@@ -445,12 +492,16 @@ final class VoiceCommandManager {
     private let lock = NSLock()
     private var lastStart: TimeInterval = 0
     private var lastStop: TimeInterval = 0
+    /// 优先离线识别，失败后回退在线识别
+    private var useOnDevice = true
 
     var startWords: [String] = ["开始录像", "开始录制", "开始拍摄", "录一下", "开始"]
     var stopWords: [String] = ["停止录像", "结束录像", "停止录制", "结束录制", "停止拍摄", "停止", "保存"]
 
     func start() {
-        guard !running else { return }
+        lock.lock()
+        if running { lock.unlock(); return }
+        lock.unlock()
         SFSpeechRecognizer.requestAuthorization { [weak self] st in
             guard let self = self else { return }
             guard st == .authorized else {
@@ -470,23 +521,38 @@ final class VoiceCommandManager {
         onListeningChanged?(false)
     }
 
+    /// 首次启动：置位 running 后建立识别任务
     private func begin() {
         lock.lock()
         if running { lock.unlock(); return }
         running = true
+        lock.unlock()
+        startTask()
+    }
+
+    /// 建立/重建一次识别任务；restart 复用（绕过 running 守卫，这是之前语音只在第一次生效的根因）
+    private func startTask() {
+        lock.lock()
+        guard running else { lock.unlock(); return }
         let r = SFSpeechAudioBufferRecognitionRequest()
         r.shouldReportPartialResults = true
-        if recognizer?.supportsOnDeviceRecognition == true { r.requiresOnDeviceRecognition = true }
+        let supportsOnDevice = recognizer?.supportsOnDeviceRecognition ?? false
+        if supportsOnDevice && useOnDevice { r.requiresOnDeviceRecognition = true }
         request = r
         lock.unlock()
         onListeningChanged?(true)
+        if recognizer == nil { Log.write("[Voice] 识别器不可用(zh-CN)") }
         task = recognizer?.recognitionTask(with: r) { [weak self] result, error in
             guard let self = self else { return }
             if let result = result {
                 let text = result.bestTranscription.formattedString
+                if !text.isEmpty { Log.write("[Voice] 听到: \(text)") }
                 self.handle(text)
                 if result.isFinal { DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { self.restart() } }
-            } else if error != nil {
+            } else if let error = error {
+                Log.write("[Voice] 识别错误: \(error.localizedDescription)")
+                // 离线识别失败（模型未下载等）→ 回退在线识别
+                if supportsOnDevice { self.useOnDevice = false }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.restart() }
             }
         }
@@ -500,20 +566,27 @@ final class VoiceCommandManager {
         lock.unlock()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
             guard let self = self, self.running else { return }
-            self.begin()
+            self.startTask()
         }
     }
 
     private func handle(_ text: String) {
         let now = Date().timeIntervalSince1970
-        if startWords.contains(where: { text.contains($0) }) {
+        // 去掉空格与常见标点，避免"开始 录像。""被识别成带间隔的文本匹配不上
+        let t = text.replacingOccurrences(of: " ", with: "")
+            .replacingOccurrences(of: "。", with: "")
+            .replacingOccurrences(of: "，", with: "")
+            .replacingOccurrences(of: ",", with: "")
+        if startWords.contains(where: { t.contains($0) }) {
             if now - lastStart > 3 {
                 lastStart = now
+                Log.write("[Voice] 触发开始录像")
                 DispatchQueue.main.async { [weak self] in self?.onStart?() }
             }
-        } else if stopWords.contains(where: { text.contains($0) }) {
+        } else if stopWords.contains(where: { t.contains($0) }) {
             if now - lastStop > 3 {
                 lastStop = now
+                Log.write("[Voice] 触发停止录像")
                 DispatchQueue.main.async { [weak self] in self?.onStop?() }
             }
         }
@@ -529,20 +602,23 @@ final class VoiceCommandManager {
         if Int(src.format.sampleRate) == 16000 && src.format.channelCount == 1 { return src }
         guard let dst = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false),
               let conv = AVAudioConverter(from: src.format, to: dst) else { return nil }
-        let cap = AVAudioFrameCount((Double(src.frameLength) * 16000.0 / src.format.sampleRate).rounded(.up)) + 256
+        let ratio = 16000.0 / src.format.sampleRate
+        let cap = AVAudioFrameCount(Double(src.frameLength) * ratio) + 1024
         guard let out = AVAudioPCMBuffer(pcmFormat: dst, frameCapacity: cap) else { return nil }
         var fed = false
-        var converted: AVAudioFrameCount = 0
-        while converted < cap {
-            let st = conv.convert(to: out, error: nil) { _, status in
+        var attempts = 0
+        while attempts < 8 {
+            attempts += 1
+            var err: NSError?
+            let st = conv.convert(to: out, error: &err) { _, status in
                 if fed { status.pointee = .endOfStream; return nil }
                 fed = true; status.pointee = .haveData; return src
             }
-            if st == .error || st == .endOfStream { break }
-            converted = out.frameLength
+            if st == .error { return nil }
+            if st == .endOfStream { break }
+            if st == .haveData && out.frameLength > 0 { break }
         }
-        out.frameLength = converted
-        return converted > 0 ? out : nil
+        return out.frameLength > 0 ? out : nil
     }
 }
 
@@ -608,6 +684,8 @@ final class CameraEngine: NSObject, ObservableObject {
     @Published var startWords: [String] = ["开始录像", "开始录制", "开始拍摄", "录一下"]
     @Published var stopWords: [String] = ["停止录像", "结束录像", "停止录制", "保存"]
     @Published var debugOverlay = false
+    @Published var debugText = ""
+    @Published var logPanel = false
 
     let session = AVCaptureSession()
     let motion = MotionManager()
@@ -632,19 +710,28 @@ final class CameraEngine: NSObject, ObservableObject {
     // 跨线程共享标志（统一由 stateLock 保护）
     private let stateLock = NSLock()
     private var _recording = false
+    private var _starting = false
+    private var _live = false
     private var _preRecordFlag = true
     private var _voiceFlag = false
     private var _pending = false
     private var isConfigured = false
     private var screenOffTimer: Timer?
     private var recordTimer: Timer?
+    private var logTimer: Timer?
 
     private var recordingFlag: Bool { stateLock.lock(); defer { stateLock.unlock() }; return _recording }
     private var preRecordFlag: Bool { stateLock.lock(); defer { stateLock.unlock() }; return _preRecordFlag }
     private var voiceFlag: Bool { stateLock.lock(); defer { stateLock.unlock() }; return _voiceFlag }
-    private func takePending() -> Bool {
-        stateLock.lock(); defer { stateLock.unlock() }
-        let p = _pending; _pending = false; return p
+    private var pendingFlag: Bool { stateLock.lock(); defer { stateLock.unlock() }; return _pending }
+    private func clearPending() { stateLock.lock(); _pending = false; stateLock.unlock() }
+    /// 录制启动失败时复位状态，避免卡在"假录制"
+    private func resetRecordingState() {
+        stateLock.lock(); _recording = false; _starting = false; _live = false; _pending = false; stateLock.unlock()
+        DispatchQueue.main.async {
+            self.isRecording = false
+            self.stopRecordTimer()
+        }
     }
 
     // MARK: 生命周期
@@ -654,6 +741,15 @@ final class CameraEngine: NSObject, ObservableObject {
                               options: [.defaultToSpeaker, .allowBluetooth, .mixWithOthers])
         try? ases.setActive(true)
         motion.start()
+        // 提前请求相册写入权限，避免录制完才发现无法保存
+        PHPhotoLibrary.requestAuthorization(for: .addOnly) { _ in }
+        logTimer?.invalidate()
+        logTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            guard self.debugOverlay || self.logPanel else { return }
+            let t = LogBuffer.text()
+            DispatchQueue.main.async { self.debugText = t }
+        }
         batteryMonitor.start { [weak self] lvl in
             DispatchQueue.main.async { self?.battery = lvl }
         }
@@ -727,6 +823,8 @@ final class CameraEngine: NSObject, ObservableObject {
     func switchLens() {
         sessionQueue.async { [weak self] in
             guard let self = self else { return }
+            if self.recordingFlag { Log.write("[Lens] 录制中不切换镜头"); return }
+            self.videoRing?.removeAll(); self.audioRing?.removeAll()
             guard let dev = self.deviceFor(self.lens),
                   let newInput = try? AVCaptureDeviceInput(device: dev) else { return }
             if self.lens == .front, self.videoDevice?.position == .back, self.torchOn { self.setTorchLocked(false) }
@@ -749,6 +847,8 @@ final class CameraEngine: NSObject, ObservableObject {
     private func reconfigure() {
         sessionQueue.async { [weak self] in
             guard let self = self else { return }
+            if self.recordingFlag { Log.write("[Session] 录制中不切换分辨率"); return }
+            self.videoRing?.removeAll(); self.audioRing?.removeAll()
             self.session.beginConfiguration()
             if self.session.canSetSessionPreset(self.resolution.preset) {
                 self.session.sessionPreset = self.resolution.preset
@@ -823,22 +923,53 @@ final class CameraEngine: NSObject, ObservableObject {
 
     private func handleEncoded(_ sb: CMSampleBuffer) {
         if preRecordFlag { videoRing?.append(sb) }
-        if recordingFlag { writer.appendVideo(sb); return }
-        if takePending() {
-            let url = makeURL()
-            let t = transformForWriter()
-            let a = audioRing?.snapshot() ?? []
-            writer.start(video: [sb], audio: a, url: url, transform: t) { ok in
-                Log.write("[Record] 首帧建 writer ok=\(ok)")
+        // 缓冲为空时按下录制：等第一个关键帧再建 writer。
+        // 必须先于 recordingFlag 判断，否则 writer 永远建不起来（假录制）
+        if pendingFlag {
+            guard sb.isKeyFrame else { return }
+            clearPending()
+            let startPTS = CMSampleBufferGetPresentationTimeStamp(sb)
+            let a = (audioRing?.snapshot() ?? []).filter {
+                CMTimeCompare(CMSampleBufferGetPresentationTimeStamp($0), startPTS) >= 0
             }
+            startWriter(video: [sb], audio: a)
+            return
+        }
+        if recordingFlag { writer.appendVideo(sb) }
+    }
+
+    /// 统一启动写入器；失败时复位录制状态，避免卡死
+    private func startWriter(video: [CMSampleBuffer], audio: [CMSampleBuffer]) {
+        guard recordingFlag else {
+            Log.write("[Record] 录制已被取消，忽略启动")
+            resetRecordingState()
+            return
+        }
+        guard !video.isEmpty else {
+            resetRecordingState(); showStatus("录像启动失败：无画面")
+            return
+        }
+        let url = makeURL()
+        let t = transformForWriter()
+        writer.start(video: video, audio: audio, url: url, transform: t) { [weak self] ok in
+            guard let self = self else { return }
+            self.stateLock.lock()
+            self._starting = false
+            let stillWanted = self._recording
+            if ok && stillWanted { self._live = true }
+            self.stateLock.unlock()
+            Log.write("[Record] writer 启动 ok=\(ok) v=\(video.count) a=\(audio.count)")
+            if !ok && stillWanted { self.resetRecordingState(); self.showStatus("录像启动失败") }
         }
     }
 
     // MARK: 录制
     func startRecording() {
         stateLock.lock()
-        if _recording { stateLock.unlock(); return }
+        if _recording || _starting { stateLock.unlock(); return }
         _recording = true
+        _starting = true
+        _live = false
         stateLock.unlock()
 
         resetScreenOffTimer()
@@ -853,6 +984,7 @@ final class CameraEngine: NSObject, ObservableObject {
 
         sessionQueue.async { [weak self] in
             guard let self = self else { return }
+            guard self.recordingFlag else { return }
             let vAll = self.videoRing?.snapshot() ?? []
             let aAll = self.audioRing?.snapshot() ?? []
             let v = self.preRecordFlag ? self.trimToFirstKeyframe(vAll) : self.trimToLastKeyframe(vAll)
@@ -860,26 +992,27 @@ final class CameraEngine: NSObject, ObservableObject {
             let a = aAll.filter { CMTimeCompare(CMSampleBufferGetPresentationTimeStamp($0), startPTS) >= 0 }
 
             if v.isEmpty {
-                // 还没有可用帧（刚启动）：等第一帧到来后再建 writer
-                self.stateLock.lock(); self._pending = true; self.stateLock.unlock()
-                Log.write("[Record] 暂无缓冲帧，等待首帧")
+                // 还没有可用帧（刚启动）：等第一帧关键帧到来后再建 writer
+                self.stateLock.lock()
+                if self._recording { self._pending = true }
+                self.stateLock.unlock()
+                Log.write("[Record] 暂无缓冲帧，等待首帧关键帧")
                 return
             }
-            let url = self.makeURL()
-            let t = self.transformForWriter()
-            self.writer.start(video: v, audio: a, url: url, transform: t) { ok in
-                Log.write("[Record] writer 启动 ok=\(ok) v=\(v.count) a=\(a.count)")
-                if !ok { DispatchQueue.main.async { self.showStatus("录像启动失败") } }
-            }
+            self.startWriter(video: v, audio: a)
         }
     }
 
     func stopRecording() {
         stateLock.lock()
-        if !_recording { stateLock.unlock(); return }
+        let wasActive = _recording || _starting
+        let live = _live
         _recording = false
+        _starting = false
+        _live = false
+        _pending = false
         stateLock.unlock()
-        stateLock.lock(); _pending = false; stateLock.unlock()
+        guard wasActive else { return }
 
         if shutterSound { sound.playStop() }
         DispatchQueue.main.async {
@@ -890,7 +1023,7 @@ final class CameraEngine: NSObject, ObservableObject {
 
         writer.finish { url in
             guard let url = url else {
-                DispatchQueue.main.async { self.showStatus("保存失败") }
+                if live { DispatchQueue.main.async { self.showStatus("保存失败") } }
                 return
             }
             PhotoLibrary.save(url) { ok in
@@ -910,10 +1043,12 @@ final class CameraEngine: NSObject, ObservableObject {
         return Array(arr[idx...])
     }
 
+    private var recordSeq = 0
     private func makeURL() -> URL {
         let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         let f = DateFormatter(); f.dateFormat = "yyyyMMdd_HHmmss"
-        return dir.appendingPathComponent("Fishing_\(f.string(from: Date())).mp4")
+        recordSeq += 1
+        return dir.appendingPathComponent("Fishing_\(f.string(from: Date()))_\(recordSeq).mp4")
     }
 
     private func transformForWriter() -> CGAffineTransform {
@@ -969,9 +1104,15 @@ final class CameraEngine: NSObject, ObservableObject {
     private func stopRecordTimer() { recordTimer?.invalidate(); recordTimer = nil }
 
     private func showStatus(_ s: String) {
-        status = s
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
-            if self?.status == s { self?.status = nil }
+        DispatchQueue.main.async {
+            self.status = s
+            if s.contains("失败") || s.contains("错误") {
+                self.logPanel = true
+                DispatchQueue.main.asyncAfter(deadline: .now() + 12) { [weak self] in self?.logPanel = false }
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
+                if self?.status == s { self?.status = nil }
+            }
         }
     }
 
@@ -1020,9 +1161,17 @@ extension CameraEngine: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureA
         let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb)
         if encoderSize != CGSize(width: w, height: h) {
             encoderSize = CGSize(width: w, height: h)
+            // 帧格式变化（切换分辨率/镜头）：清空预录缓冲，避免新旧格式帧写入同一文件导致崩溃
+            videoRing?.removeAll()
+            audioRing?.removeAll()
             let bitrate = max(w * h * 2, 4_000_000)
             encoder.configure(width: w, height: h, fps: frameRate.rawValue, bitrate: bitrate)
             frameCount = 0
+            if recordingFlag {
+                Log.write("[Video] 录制中画面尺寸变化，停止当前录制避免文件损坏")
+                DispatchQueue.main.async { self.stopRecording() }
+                return
+            }
         }
         // 始终编码：预录需要持续缓冲，且能在按下录制时立即拿到关键帧与编码参数
         let pts = CMSampleBufferGetPresentationTimeStamp(sb)
@@ -1062,11 +1211,20 @@ extension CMSampleBuffer {
 // MARK: - 保存相册
 enum PhotoLibrary {
     static func save(_ url: URL, completion: @escaping (Bool) -> Void) {
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            Log.write("[Photos] 文件不存在 \(url.lastPathComponent)")
+            completion(false); return
+        }
         PHPhotoLibrary.requestAuthorization(for: .addOnly) { st in
-            guard st == .authorized || st == .limited else { completion(false); return }
+            guard st == .authorized || st == .limited else {
+                Log.write("[Photos] 无相册权限 st=\(st.rawValue)")
+                completion(false); return
+            }
             PHPhotoLibrary.shared().performChanges {
                 PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: url)
-            } completionHandler: { ok, _ in
+            } completionHandler: { ok, err in
+                if let err = err { Log.write("[Photos] 保存出错 \(err.localizedDescription)") }
+                else { Log.write("[Photos] 保存\(ok ? "成功" : "失败")") }
                 completion(ok)
             }
         }
@@ -1122,7 +1280,10 @@ private struct VolumeBtn: UIViewRepresentable {
             let sel = NSSelectorFromString("initWithHandler:")
             if cls.responds(to: sel) {
                 let handler: @convention(block) (AnyObject) -> Void = { e in
-                    if let phase = e.value(forKey: "phase") as? Int, phase == 2 {
+                    // 用 responds(to:) 先探测，避免 value(forKey:) 抛 NSUnknownKeyException 崩溃
+                    guard let obj = e as? NSObject,
+                          obj.responds(to: NSSelectorFromString("phase")) else { return }
+                    if let phase = obj.value(forKey: "phase") as? Int, phase == 2 {
                         DispatchQueue.main.async { action() }
                     }
                 }
@@ -1249,6 +1410,22 @@ struct CameraScreen: View {
                     Spacer()
                 }
                 .transition(.opacity)
+            }
+
+            if engine.debugOverlay || engine.logPanel {
+                VStack {
+                    Spacer()
+                    Text(engine.debugText.isEmpty ? "日志…" : engine.debugText)
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundColor(Color(red: 0.55, green: 1.0, blue: 0.6))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(8)
+                        .background(Color.black.opacity(0.62))
+                        .cornerRadius(8)
+                        .padding(.horizontal, 10)
+                        .padding(.bottom, 132)
+                }
+                .allowsHitTesting(false)
             }
 
             if engine.screenOff {
@@ -1387,23 +1564,23 @@ struct SettingsView: View {
     var body: some View {
         NavigationView {
             Form {
-                Section(header: Text("画面")) {
+                Section(header: Text("画面"), footer: engine.isRecording ? Text("录制中，画面参数暂不可调") : Text("")) {
                     Picker("镜头", selection: $engine.lens) {
                         ForEach(CameraLens.allCases) { Text($0.rawValue).tag($0) }
-                    }
+                    }.disabled(engine.isRecording)
                     Picker("分辨率", selection: $engine.resolution) {
                         ForEach(VideoResolution.allCases) { Text($0.rawValue).tag($0) }
-                    }
+                    }.disabled(engine.isRecording)
                     Picker("帧率", selection: $engine.frameRate) {
                         ForEach(FrameRateOption.allCases) { Text("\($0.rawValue) fps").tag($0) }
-                    }
+                    }.disabled(engine.isRecording)
                     Picker("防抖", selection: $engine.stabilization) {
                         ForEach(StabilizationLevel.allCases) { Text($0.rawValue).tag($0) }
-                    }
+                    }.disabled(engine.isRecording)
                     Picker("画面比例", selection: $engine.previewMode) {
                         ForEach(PreviewMode.allCases) { Text($0.rawValue).tag($0) }
                     }
-                    Toggle("水平镜像", isOn: $engine.mirror)
+                    Toggle("水平镜像", isOn: $engine.mirror).disabled(engine.isRecording)
                 }
 
                 Section(header: Text("预录（不错过精彩瞬间）")) {
