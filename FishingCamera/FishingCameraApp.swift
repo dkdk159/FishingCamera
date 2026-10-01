@@ -814,7 +814,7 @@ extension CameraEngine: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureA
 }
 
 // MARK: - AVCaptureFileOutputRecordingDelegate
-extension CameraEngine: AVCaptureFileOutputRecordingDelegate {
+extension CameraEngine: AVCaptureFileOutputRecordingDelegate, AVCaptureFileOutputDelegate {
     func fileOutput(_ output: AVCaptureFileOutput, didStartRecordingTo fileURL: URL, from connections: [AVCaptureConnection]) {
         print("[MovieOutput] didStartRecordingTo \(fileURL.lastPathComponent)")
         DispatchQueue.main.async { [weak self] in
