@@ -199,110 +199,189 @@ final class VideoCompressor {
     }
 }
 
-// MARK: - 录制写入器（只在 sessionQueue 上调用）
+// MARK: - 录制写入器（泵模式。所有方法只在 writerQueue 调用，绝不阻塞采集线程）
+// 设计依据 Apple AVCam / RosyWriter：
+// - requestMediaDataWhenReady 驱动喂帧，历史帧与实时帧统一排队，严格按 PTS 写入
+// - expectsMediaDataInRealTime = false，允许一次性灌入历史帧而不触发实时丢帧/坏文件
+// - 任何 writer 失败立即通过 onFail 上报完整错误域与错误码
 final class Recorder {
     private var writer: AVAssetWriter?
-    private var vIn: AVAssetWriterInput?
-    private var aIn: AVAssetWriterInput?
-    private var finishing = false
-    private var sessionStarted = false
+    private var vi: AVAssetWriterInput?
+    private var ai: AVAssetWriterInput?
+    private let q: DispatchQueue
 
-    @discardableResult
-    func begin(video: [CMSampleBuffer], audio: [CMSampleBuffer],
-               url: URL, format: CMFormatDescription, portrait: Bool) -> Bool {
+    private var histV: [CMSampleBuffer] = []
+    private var histA: [CMSampleBuffer] = []
+    private var liveV: [CMSampleBuffer] = []
+    private var liveA: [CMSampleBuffer] = []
+
+    private var finishing = false
+    private var finishCalled = false
+    private var vMarked = false
+    private var aMarked = true
+
+    private let activeLock = NSLock()
+    private var _active = false
+    /// 供采集线程跨队列判断当前是否需要把帧送入写入器
+    var isActive: Bool { activeLock.lock(); defer { activeLock.unlock() }; return _active }
+
+    /// 主线程回调
+    var onFail: ((String) -> Void)?
+    var onFinish: ((URL?) -> Void)?
+
+    init(queue: DispatchQueue) { self.q = queue }
+
+    // MARK: 开始（histVideo 为已编码 H264，histAudio 为 PCM）
+    func begin(histVideo: [CMSampleBuffer], histAudio: [CMSampleBuffer], url: URL,
+               portrait: Bool, front: Bool) {
+        // passthrough 首帧必须是关键帧（自带 SPS/PPS）
+        var v = histVideo
+        if let ki = v.firstIndex(where: { isKeyFrame($0) }) { v = Array(v[ki...]) } else { v = [] }
+        guard let firstV = v.first, let fd = CMSampleBufferGetFormatDescription(firstV) else {
+            DispatchQueue.main.async { [weak self] in
+                self?.onFail?("预录缓冲还没准备好，请等 1～2 秒再按录制")
+            }
+            return
+        }
         do {
-            if FileManager.default.fileExists(atPath: url.path) { try? FileManager.default.removeItem(at: url) }
+            if FileManager.default.fileExists(atPath: url.path) {
+                try FileManager.default.removeItem(at: url)
+            }
             let w = try AVAssetWriter(outputURL: url, fileType: .mp4)
 
-            // passthrough：帧已由 VideoToolbox 编码为 H264
-            let vi = AVAssetWriterInput(mediaType: .video, outputSettings: nil, sourceFormatHint: format)
-            vi.expectsMediaDataInRealTime = true
-            if portrait { vi.transform = CGAffineTransform(rotationAngle: .pi / 2) }
-            if w.canAdd(vi) { w.add(vi) }
+            let vIn = AVAssetWriterInput(mediaType: .video, outputSettings: nil, sourceFormatHint: fd)
+            vIn.expectsMediaDataInRealTime = false
+            if portrait {
+                // 后置竖屏 +90°；前置竖屏 -90° 并水平翻转，朝向与原相机一致
+                var t = CGAffineTransform(rotationAngle: front ? -.pi / 2 : .pi / 2)
+                if front { t = t.scaledBy(x: -1, y: 1) }
+                vIn.transform = t
+            }
+            guard w.canAdd(vIn) else { abort(w, reason: "无法添加视频轨道"); return }
+            w.add(vIn)
 
-            let ai = AVAssetWriterInput(mediaType: .audio, outputSettings: [
+            // 音频：只指定 AAC，采样率/声道跟随源（麦克风通常 48kHz），避免声明不一致导致失败
+            let aCand = AVAssetWriterInput(mediaType: .audio, outputSettings: [
                 AVFormatIDKey: kAudioFormatMPEG4AAC,
-                AVNumberOfChannelsKey: 1,
-                AVSampleRateKey: 44100,
-                AVEncoderBitRateKey: 128000])
-            ai.expectsMediaDataInRealTime = true
-            if w.canAdd(ai) { w.add(ai) }
+                AVEncoderBitRateKey: 128_000])
+            aCand.expectsMediaDataInRealTime = false
+            let aIn: AVAssetWriterInput? = w.canAdd(aCand) ? { w.add(aCand); return aCand }() : nil
 
-            w.startWriting()
+            guard w.startWriting() else { abort(w, reason: "启动文件写入失败"); return }
 
-            // 历史视频必须从关键帧开始
-            var v = video
-            if let ki = v.firstIndex(where: { isKeyFrame($0) }) { v = Array(v[ki...]) } else { v = [] }
-            guard let start = v.first?.presentationTimeStamp ?? audio.first?.presentationTimeStamp else {
-                // 无历史：等实时关键帧到达再开 session
-                writer = w; vIn = vi; aIn = ai
-                print("[REC] begin, waiting live keyframe")
-                return true
-            }
-            let a = audio.filter { $0.presentationTimeStamp.seconds >= start.seconds - 0.002 }
+            let start = firstV.presentationTimeStamp
             w.startSession(atSourceTime: start)
-            sessionStarted = true
 
-            var vi2 = 0, ai2 = 0
-            while vi2 < v.count || ai2 < a.count {
-                if ai2 >= a.count || (vi2 < v.count
-                    && v[vi2].presentationTimeStamp.seconds <= a[ai2].presentationTimeStamp.seconds) {
-                    if Self.waitReady(vi) { vi.append(v[vi2]) }
-                    vi2 += 1
-                } else {
-                    if Self.waitReady(ai) { ai.append(a[ai2]) }
-                    ai2 += 1
-                }
-            }
-            writer = w; vIn = vi; aIn = ai
-            print("[REC] begin history v=\(v.count) a=\(a.count)")
-            return true
+            histV = v
+            histA = histAudio.filter { $0.presentationTimeStamp.seconds >= start.seconds - 0.02 }
+            liveV = []; liveA = []
+            writer = w; vi = vIn; ai = aIn
+            finishing = false; finishCalled = false
+            vMarked = false; aMarked = (aIn == nil)
+            activeLock.lock(); _active = true; activeLock.unlock()
+
+            vIn.requestMediaDataWhenReady(on: q) { [weak self] in self?.pumpVideo() }
+            aIn?.requestMediaDataWhenReady(on: q) { [weak self] in self?.pumpAudio() }
+            print("[REC] begin hist v=\(v.count) a=\(histA.count)")
         } catch {
-            print("[REC] begin error: \(error)")
-            return false
-        }
-    }
-
-    private static func waitReady(_ input: AVAssetWriterInput) -> Bool {
-        var n = 0
-        while !input.isReadyForMoreMediaData, n < 50 {
-            usleep(10_000); n += 1
-            if Thread.current.isCancelled { return false }
-        }
-        return input.isReadyForMoreMediaData
-    }
-
-    func appendVideo(_ sb: CMSampleBuffer) {
-        guard let w = writer, !finishing, w.status == .writing else { return }
-        if !sessionStarted {
-            guard isKeyFrame(sb) else { return }
-            w.startSession(atSourceTime: sb.presentationTimeStamp)
-            sessionStarted = true
-        }
-        if vIn?.isReadyForMoreMediaData == true { vIn?.append(sb) }
-    }
-
-    func appendAudio(_ sb: CMSampleBuffer) {
-        guard let w = writer, !finishing, w.status == .writing else { return }
-        if !sessionStarted {
-            w.startSession(atSourceTime: sb.presentationTimeStamp)
-            sessionStarted = true
-        }
-        if aIn?.isReadyForMoreMediaData == true { aIn?.append(sb) }
-    }
-
-    func finish(_ done: @escaping (URL?) -> Void) {
-        guard let w = writer, !finishing else { done(nil); return }
-        finishing = true
-        vIn?.markAsFinished(); aIn?.markAsFinished()
-        w.finishWriting {
-            let url = w.status == .completed ? w.outputURL : nil
-            if let e = w.error { print("[REC] finish error: \(e)") }
             DispatchQueue.main.async { [weak self] in
-                self?.writer = nil; self?.vIn = nil; self?.aIn = nil
-                self?.finishing = false; self?.sessionStarted = false
-                done(url)
+                self?.onFail?("创建视频文件失败：\(error.localizedDescription)")
             }
+        }
+    }
+
+    // MARK: 实时帧入队（writerQueue）
+    func enqueueVideo(_ sb: CMSampleBuffer) {
+        guard writing else { return }
+        liveV.append(sb)
+        pumpVideo()
+    }
+
+    func enqueueAudio(_ sb: CMSampleBuffer) {
+        guard writing else { return }
+        liveA.append(sb)
+        pumpAudio()
+    }
+
+    private var writing: Bool {
+        if let w = writer, !finishing, w.status == .writing { return true }
+        return false
+    }
+
+    // MARK: 泵
+    private func pumpVideo() {
+        guard let w = writer, let inp = vi else { return }
+        while inp.isReadyForMoreMediaData, w.status == .writing {
+            let s: CMSampleBuffer? = !histV.isEmpty ? histV.removeFirst()
+                                   : (!liveV.isEmpty ? liveV.removeFirst() : nil)
+            guard let s = s else {
+                if finishing, !vMarked { vMarked = true; inp.markAsFinished(); tryFinish(w) }
+                return
+            }
+            if !inp.append(s) { abort(w, reason: "写入视频帧失败"); return }
+        }
+        if w.status == .failed { abort(w, reason: "视频写入中断") }
+    }
+
+    private func pumpAudio() {
+        guard let w = writer, let inp = ai else {
+            if finishing, !aMarked { aMarked = true; if let w = writer { tryFinish(w) } }
+            return
+        }
+        while inp.isReadyForMoreMediaData, w.status == .writing {
+            let s: CMSampleBuffer? = !histA.isEmpty ? histA.removeFirst()
+                                   : (!liveA.isEmpty ? liveA.removeFirst() : nil)
+            guard let s = s else {
+                if finishing, !aMarked { aMarked = true; inp.markAsFinished(); tryFinish(w) }
+                return
+            }
+            if !inp.append(s) { abort(w, reason: "写入音频帧失败"); return }
+        }
+        if w.status == .failed { abort(w, reason: "音频写入中断") }
+    }
+
+    // MARK: 结束（writerQueue）
+    func finish() {
+        guard let w = writer else {
+            DispatchQueue.main.async { [weak self] in self?.onFinish?(nil) }
+            return
+        }
+        guard !finishing else { return }
+        finishing = true
+        pumpVideo()
+        pumpAudio()
+    }
+
+    private func tryFinish(_ w: AVAssetWriter) {
+        guard finishing, vMarked, aMarked, !finishCalled else { return }
+        finishCalled = true
+        w.finishWriting { [weak self] in
+            let ok = w.status == .completed
+            let url = ok ? w.outputURL : nil
+            if let e = w.error { print("[REC] finish error: \(e)") }
+            self?.q.async { self?.reset(url: url) }
+        }
+    }
+
+    // MARK: 失败处理 / 重置
+    private func abort(_ w: AVAssetWriter, reason: String) {
+        let e = w.error as NSError?
+        let detail = "\(reason)：\(e?.localizedDescription ?? "未知") [\(e?.domain ?? "AVF") \(e?.code ?? 0)] status=\(w.status.rawValue)"
+        print("[REC] \(detail)")
+        if w.status == .writing { w.cancelWriting() }
+        reset(url: nil, failMessage: detail)
+    }
+
+    private func reset(url: URL?, failMessage: String? = nil) {
+        activeLock.lock(); _active = false; activeLock.unlock()
+        writer = nil; vi = nil; ai = nil
+        histV = []; histA = []; liveV = []; liveA = []
+        finishing = false; finishCalled = false; vMarked = false; aMarked = true
+        let cb = onFinish
+        let fail = onFail
+        let msg = failMessage
+        DispatchQueue.main.async {
+            if let msg = msg { fail?(msg) } else { cb?(url) }
         }
     }
 }
@@ -521,21 +600,29 @@ final class CameraEngine: NSObject, ObservableObject {
 
     let session = AVCaptureSession()
     private let sq = DispatchQueue(label: "com.actioncam.session")
+    /// 所有录制数据面（环形缓冲 / AVAssetWriter）只在此队列访问，采集线程永不阻塞
+    private let wq = DispatchQueue(label: "com.actioncam.writer")
     private let vOut = AVCaptureVideoDataOutput()
     private let aOut = AVCaptureAudioDataOutput()
+    private let movieOut = AVCaptureMovieFileOutput()
     private var device: AVCaptureDevice?
     private var enc = VideoCompressor()
+    private var rec: Recorder!
     private var vRing = SampleRingBuffer(maxSeconds: 30, maxBytes: 200 * 1024 * 1024)
     private var aRing = SampleRingBuffer(maxSeconds: 30, maxBytes: 8 * 1024 * 1024)
-    private let rec = Recorder()
+    private var movieURL: URL?
 
     /// 预录缓冲内存预算，防止 4K/高帧率长预录被系统杀死
     private static let videoBudget = 200 * 1024 * 1024
     private static let audioBudget = 8 * 1024 * 1024
 
     private var started = false
-    private var recording = false
-    private var preSec: TimeInterval = 30
+    private let preLock = NSLock()
+    private var _preSec: TimeInterval = 30
+    private var preSec: TimeInterval {
+        get { preLock.lock(); defer { preLock.unlock() }; return _preSec }
+        set { preLock.lock(); _preSec = newValue; preLock.unlock() }
+    }
     private var delayTimer: Timer?
     private var batteryTimer: Timer?
     private var heardDismissWork: DispatchWorkItem?
@@ -546,6 +633,7 @@ final class CameraEngine: NSObject, ObservableObject {
 
     override init() {
         super.init()
+        rec = Recorder(queue: wq)
         VoiceController.shared.onCommand = { [weak self] c in
             guard let self = self else { return }
             if c == "start" { if !self.isRecording { self.startRecording() } }
@@ -714,17 +802,31 @@ final class CameraEngine: NSObject, ObservableObject {
             session.addInput(mInput)
         }
 
-        vOut.alwaysDiscardsLateVideoFrames = true
-        vOut.setSampleBufferDelegate(self, queue: sq)
-        if session.canAddOutput(vOut) { session.addOutput(vOut) }
+        // 双通道：预录开启→原始帧+硬件编码环形缓冲；预录关闭→系统 MovieFileOutput（与原相机同级可靠）
+        if preSec > 0 {
+            vOut.alwaysDiscardsLateVideoFrames = true
+            vOut.setSampleBufferDelegate(self, queue: sq)
+            if session.canAddOutput(vOut) { session.addOutput(vOut) }
 
-        aOut.setSampleBufferDelegate(self, queue: sq)
-        if micGranted, session.canAddOutput(aOut) { session.addOutput(aOut) }
+            aOut.setSampleBufferDelegate(self, queue: sq)
+            if micGranted, session.canAddOutput(aOut) { session.addOutput(aOut) }
 
-        if let c = vOut.connection(with: .video) {
-            if c.isVideoOrientationSupported { c.videoOrientation = .portrait }
-            c.automaticallyAdjustsVideoMirroring = false
-            c.isVideoMirrored = (wantPos == .front)
+            if let c = vOut.connection(with: .video) {
+                // 关键：dataOutput 不设 videoOrientation，缓冲保持传感器横向方向，
+                // 竖屏完全交给 AVAssetWriterInput.transform，避免双重旋转导致坏文件
+                c.automaticallyAdjustsVideoMirroring = false
+                c.isVideoMirrored = (wantPos == .front)
+            }
+        } else {
+            if session.canAddOutput(movieOut) { session.addOutput(movieOut) }
+            if let c = movieOut.connection(with: .video) {
+                if c.isVideoOrientationSupported { c.videoOrientation = .portrait }
+                c.automaticallyAdjustsVideoMirroring = false
+                c.isVideoMirrored = (wantPos == .front)
+            }
+            // 音频 dataOutput 与 MovieFileOutput 可共存：仅用于语音识别，不干扰系统录音
+            aOut.setSampleBufferDelegate(self, queue: sq)
+            if micGranted, session.canAddOutput(aOut) { session.addOutput(aOut) }
         }
 
         do {
@@ -775,18 +877,26 @@ final class CameraEngine: NSObject, ObservableObject {
         else if dim.width >= 1920 { base = 8_000_000 }
         else { base = 4_500_000 }
         let br = min(Int(Double(base) * fpsFactor), 60_000_000)
-        enc.configure(width: dim.width, height: dim.height, fps: Int32(max(effFps, 24)), bitRate: br)
-
-        enc.onEncoded = { [weak self] kept in
-            // kept 已被复制，可安全入队
-            self?.sq.async {
+        // 仅预录通道需要持续硬件编码；预录关闭时由 MovieFileOutput 内部编码，更省电
+        if preSec > 0 {
+            enc.configure(width: dim.width, height: dim.height, fps: Int32(max(effFps, 24)), bitRate: br)
+            enc.onEncoded = { [weak self] kept in
+                // kept 已在 VT 回调内复制；统一派发到写入队列：录制中入 writer，否则入预录环
                 guard let self = self else { return }
-                if self.preSec > 0 { self.vRing.append(kept) }
-                if self.recording { self.rec.appendVideo(kept) }
+                self.wq.async {
+                    if self.rec.isActive {
+                        self.rec.enqueueVideo(kept)
+                    } else {
+                        self.vRing.append(kept)
+                    }
+                }
+            }
+            let ps = max(preSec, 1)
+            wq.async {
+                self.vRing = SampleRingBuffer(maxSeconds: ps, maxBytes: CameraEngine.videoBudget)
+                self.aRing = SampleRingBuffer(maxSeconds: ps, maxBytes: CameraEngine.audioBudget)
             }
         }
-        vRing = SampleRingBuffer(maxSeconds: max(preSec, 1), maxBytes: CameraEngine.videoBudget)
-        aRing = SampleRingBuffer(maxSeconds: max(preSec, 1), maxBytes: CameraEngine.audioBudget)
     }
 
     // MARK: 切换镜头
@@ -836,12 +946,11 @@ final class CameraEngine: NSObject, ObservableObject {
     }
 
     func setPreRecord(_ p: PreRecordOption) {
+        guard p != preRecord else { return }
+        if isRecording { flash("请先停止录制再切换预录档位"); return }
         preRecord = p; Beep.shared.tap(); preSec = p.seconds
-        sq.async { [weak self] in
-            guard let self = self else { return }
-            self.vRing = SampleRingBuffer(maxSeconds: max(p.seconds, 1), maxBytes: CameraEngine.videoBudget)
-            self.aRing = SampleRingBuffer(maxSeconds: max(p.seconds, 1), maxBytes: CameraEngine.audioBudget)
-        }
+        // 预录开关要在 dataOutput 与 MovieFileOutput 两套输出之间切换，重建会话
+        sq.async { [weak self] in self?.buildSession() }
     }
 
     func setStabilization(_ s: StabilizationLevel) {
@@ -850,8 +959,12 @@ final class CameraEngine: NSObject, ObservableObject {
     }
 
     private func applyStabilization() {
-        guard let c = vOut.connection(with: .video), c.isVideoStabilizationSupported else { return }
-        c.preferredVideoStabilizationMode = stabilization.mode
+        if let c = vOut.connection(with: .video), c.isVideoStabilizationSupported {
+            c.preferredVideoStabilizationMode = stabilization.mode
+        }
+        if let c = movieOut.connection(with: .video), c.isVideoStabilizationSupported {
+            c.preferredVideoStabilizationMode = stabilization.mode
+        }
     }
 
     func toggleTorch() {
@@ -899,48 +1012,77 @@ final class CameraEngine: NSObject, ObservableObject {
     }
 
     private func doStart() {
-        sq.async { [weak self] in
-            guard let self = self, !self.recording else { return }
-            // 等编码器产出格式描述（首帧编码后即有），最多 3 秒
-            var tries = 0
-            while self.enc.formatDescription == nil && tries < 300 { usleep(10_000); tries += 1 }
-            guard let vf = self.enc.formatDescription else {
-                DispatchQueue.main.async { self.flash("摄像头未就绪，请稍后再试") }
-                return
+        if preSec > 0 {
+            // 预录管线：准备工作全部在写入队列完成，采集线程零阻塞
+            wq.async { [weak self] in
+                guard let self = self, !self.rec.isActive else { return }
+                self.rec.onFail = { [weak self] msg in
+                    self?.isRecording = false
+                    self?.isSaving = false
+                    self?.flash(msg)
+                }
+                self.rec.onFinish = { [weak self] url in self?.handleSaved(url) }
+                self.rec.begin(histVideo: self.vRing.snapshot(),
+                               histAudio: self.aRing.snapshot(),
+                               url: self.makeURL(),
+                               portrait: true,
+                               front: self.currentLens.position == .front)
+                if self.rec.isActive {
+                    DispatchQueue.main.async { self.isRecording = true; Beep.shared.start() }
+                }
             }
-
-            let v = self.preSec > 0 ? self.vRing.snapshot() : []
-            let a = self.preSec > 0 ? self.aRing.snapshot() : []
-            let url = self.makeURL()
-            let portrait = true
-            let ok = self.rec.begin(video: v, audio: a, url: url, format: vf, portrait: portrait)
-            if !ok {
-                DispatchQueue.main.async { self.flash("无法开始录制（存储失败）") }
-                return
+        } else {
+            // 系统 MovieFileOutput 通道：与苹果原相机同一套写入，最稳、最省电
+            sq.async { [weak self] in
+                guard let self = self, !self.movieOut.isRecording else { return }
+                let url = self.makeURL()
+                self.movieURL = url
+                if let c = self.movieOut.connection(with: .video) {
+                    if c.isVideoOrientationSupported { c.videoOrientation = .portrait }
+                    c.isVideoMirrored = self.currentLens.position == .front
+                }
+                self.movieOut.startRecording(to: url, recordingDelegate: self)
+                DispatchQueue.main.async { self.isRecording = true; Beep.shared.start() }
             }
-            self.recording = true
-            DispatchQueue.main.async { self.isRecording = true; Beep.shared.start() }
         }
     }
 
     func stopRecording() {
         delayTimer?.invalidate(); delayTimer = nil; countdown = nil
         Beep.shared.stop()
-        sq.async { [weak self] in
-            guard let self = self, self.recording else { return }
-            self.recording = false
-            DispatchQueue.main.async { self.isRecording = false; self.isSaving = true }
-            self.rec.finish { [weak self] url in
-                guard let self = self else { return }
-                guard let url = url else {
-                    self.isSaving = false; self.flash("保存失败"); return
-                }
-                PhotoSaver.save(url) { ok in
-                    self.isSaving = false
-                    self.flash(ok ? "✓ 已保存到相册" : "保存失败：请允许添加到相册")
-                    try? FileManager.default.removeItem(at: url)
-                }
+        DispatchQueue.main.async { self.isRecording = false; self.isSaving = true }
+        if preSec > 0 {
+            wq.async { [weak self] in self?.rec.finish() }
+        } else {
+            sq.async { [weak self] in
+                if self?.movieOut.isRecording == true { self?.movieOut.stopRecording() }
             }
+        }
+    }
+
+    /// 统一保存入口（主线程或任意线程调用均可）
+    private func handleSaved(_ url: URL?) {
+        guard let url = url else {
+            DispatchQueue.main.async {
+                self.isSaving = false
+                self.flash("保存失败：没有生成视频文件")
+            }
+            return
+        }
+        // 预录管线：本段结束后清空环形缓冲，下一段预录从当前时刻重新积累
+        if preSec > 0 {
+            wq.async {
+                let ps = max(self.preSec, 1)
+                self.vRing = SampleRingBuffer(maxSeconds: ps, maxBytes: CameraEngine.videoBudget)
+                self.aRing = SampleRingBuffer(maxSeconds: ps, maxBytes: CameraEngine.audioBudget)
+            }
+        }
+        PhotoSaver.save(url) { [weak self] ok in
+            DispatchQueue.main.async {
+                self?.isSaving = false
+                self?.flash(ok ? "✓ 已保存到相册" : "保存失败：请允许添加到相册")
+            }
+            try? FileManager.default.removeItem(at: url)
         }
     }
 
@@ -958,20 +1100,46 @@ final class CameraEngine: NSObject, ObservableObject {
     }
 }
 
-// MARK: 采集回调（所有跨队列使用的帧都在此线程同步复制）
+// MARK: 采集回调（运行在 sq；只做极轻量操作，耗时工作全部派发 wq，绝不阻塞相机/麦克风）
 extension CameraEngine: AVCaptureVideoDataOutputSampleBufferDelegate,
                         AVCaptureAudioDataOutputSampleBufferDelegate {
     func captureOutput(_ o: AVCaptureOutput, didOutput sb: CMSampleBuffer,
                        from c: AVCaptureConnection) {
         if o === vOut {
-            enc.encode(sb) // encode 内部同步完成，VT 会自行 retain pixelBuffer
+            // VT 编码为异步，完成回调在其内部线程；回调内已复制帧并自行派发到 wq
+            enc.encode(sb)
         } else if o === aOut {
-            // 实时写入：同步消费，安全
-            if recording { rec.appendAudio(sb) }
-            // 预录音频：复制后保存
-            if preSec > 0, let copy = retainedCopy(sb) { aRing.append(copy) }
-            // 语音：同步重采样为独立缓冲
+            if preSec > 0, let copy = retainedCopy(sb) {
+                if rec.isActive {
+                    wq.async { self.rec.enqueueAudio(copy) }
+                } else {
+                    wq.async { self.aRing.append(copy) }
+                }
+            }
+            // 语音识别：内部当场重采样为独立 16kHz 缓冲
             VoiceController.shared.feed(sb)
+        }
+    }
+}
+
+// MARK: - 系统 MovieFileOutput 录制结果（预录关闭通道）
+extension CameraEngine: AVCaptureFileOutputRecordingDelegate {
+    func fileOutput(_ output: AVCaptureFileOutput,
+                    didFinishRecordingTo outputFileURL: URL,
+                    error: Error?) {
+        let nsErr = error as NSError?
+        let finishedOK = (nsErr == nil)
+            || (nsErr?.userInfo[AVErrorRecordingSuccessfullyFinishedKey] as? Bool == true)
+        if finishedOK {
+            handleSaved(outputFileURL)
+        } else {
+            let detail = "\(nsErr?.localizedDescription ?? "未知错误") [\(nsErr?.domain ?? "AVF") \(nsErr?.code ?? 0)]"
+            print("[MOVIE] \(detail)")
+            DispatchQueue.main.async {
+                self.isSaving = false
+                self.flash("保存失败：\(detail)")
+            }
+            try? FileManager.default.removeItem(at: outputFileURL)
         }
     }
 }
