@@ -350,7 +350,6 @@ final class CameraEngine: NSObject, ObservableObject {
     private let sessionQueue = DispatchQueue(label: "com.fishingcamera.session")
     private let videoOutput = AVCaptureVideoDataOutput()
     private let audioOutput = AVCaptureAudioDataOutput()
-    private let movieFileOutput = AVCaptureMovieFileOutput()
     private var currentVideoDevice: AVCaptureDevice?
     private let encoder = H264VideoEncoder()
     private var encoderWidth = 0
@@ -360,7 +359,6 @@ final class CameraEngine: NSObject, ObservableObject {
     private let writer = PreRecordWriter()
     private var isRecordingInternal = false
     private var preRecordOnInternal = false
-    private var recordingURL: URL?
     private let batteryManager = BatteryManager()
     private let voiceManager = VoiceCommandManager()
     private let audioFeedback = AudioFeedback()
@@ -467,11 +465,6 @@ final class CameraEngine: NSObject, ObservableObject {
             if self.captureSession.canAddOutput(self.videoOutput) { self.captureSession.addOutput(self.videoOutput) }
             self.audioOutput.setSampleBufferDelegate(self, queue: self.sessionQueue)
             if self.captureSession.canAddOutput(self.audioOutput) { self.captureSession.addOutput(self.audioOutput) }
-
-            // 添加 AVCaptureMovieFileOutput 用于稳定录制
-            if self.captureSession.canAddOutput(self.movieFileOutput) {
-                self.captureSession.addOutput(self.movieFileOutput)
-            }
 
             self.applyAllConnectionSettings()
             self.captureSession.commitConfiguration()
@@ -685,36 +678,42 @@ final class CameraEngine: NSObject, ObservableObject {
         }
     }
 
-    // MARK: - 录制（使用 AVCaptureMovieFileOutput，最稳定）
+    // MARK: - 录制（预录模式：缓冲帧 + 实时帧）
     func startRecording() {
         guard !isRecordingInternal else { return }
-        guard !movieFileOutput.isRecording else { return }
         suppressVoice(2.0)
         resetScreenOffTimer()
 
-        let url = makeURL()
-        recordingURL = url
-        if shutterSoundEnabled { audioFeedback.sayStart() }
-        isRecordingInternal = true
-        isRecording = true
-
         sessionQueue.async { [weak self] in
-            guard let self = self else { return }
-            // 配置 movieFileOutput 的连接
-            if let conn = self.movieFileOutput.connection(with: .video) {
-                if conn.isVideoOrientationSupported {
-                    conn.videoOrientation = self.videoOrientation.avOrientation
-                }
-                if conn.isVideoStabilizationSupported {
-                    conn.preferredVideoStabilizationMode = self.stabilizationLevel.avMode
-                }
-                if conn.isVideoMirroringSupported {
-                    conn.automaticallyAdjustsVideoMirroring = false
-                    conn.isVideoMirrored = self.mirrorHorizontal
+            guard let self = self, !self.isRecordingInternal else { return }
+
+            // 取出预录缓冲的帧
+            let all = self.compressedVideoBuffer?.snapshot() ?? []
+            let valid = self.trimToKeyframe(all)
+            let audios = self.audioBuffer?.snapshot() ?? []
+
+            print("[startRecording] videoFrames=\(valid.count) audioFrames=\(audios.count)")
+
+            self.writer.begin(
+                videoSamples: valid, audioSamples: audios,
+                outputURL: self.makeURL(),
+                mirrorVertical: self.mirrorVertical
+            ) { [weak self] success in
+                guard let self = self else { return }
+                if success {
+                    self.isRecordingInternal = true
+                    DispatchQueue.main.async {
+                        self.isRecording = true
+                        if self.shutterSoundEnabled { self.audioFeedback.sayStart() }
+                    }
+                } else {
+                    print("[startRecording] writer.begin 失败")
+                    DispatchQueue.main.async {
+                        self.lastSavedMessage = "录像启动失败"
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self.lastSavedMessage = nil }
+                    }
                 }
             }
-            self.movieFileOutput.startRecording(to: url, recordingDelegate: self)
-            print("[MovieOutput] startRecording to \(url.lastPathComponent)")
         }
     }
 
@@ -723,13 +722,15 @@ final class CameraEngine: NSObject, ObservableObject {
         if shutterSoundEnabled { audioFeedback.sayStop() }
         suppressVoice(2.0)
         resetScreenOffTimer()
-        isRecordingInternal = false
 
         sessionQueue.async { [weak self] in
-            guard let self = self else { return }
-            if self.movieFileOutput.isRecording {
-                self.movieFileOutput.stopRecording()
-                print("[MovieOutput] stopRecording")
+            guard let self = self, self.isRecordingInternal else { return }
+            self.writer.end()
+            self.isRecordingInternal = false
+            DispatchQueue.main.async {
+                self.isRecording = false
+                self.lastSavedMessage = "已保存到相册"
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self.lastSavedMessage = nil }
             }
         }
     }
@@ -804,36 +805,24 @@ final class CameraEngine: NSObject, ObservableObject {
 extension CameraEngine: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate {
     func captureOutput(_ output: AVCaptureOutput, didOutput sb: CMSampleBuffer, from conn: AVCaptureConnection) {
         if output === videoOutput {
-            // 视频帧仅用于预览，录交由 AVCaptureMovieFileOutput 处理
-        } else if output === audioOutput {
-            // 音频帧用于语音识别
-            voiceManager.feedAudio(sb)
-        }
-    }
-}
-
-// MARK: - AVCaptureFileOutputRecordingDelegate
-extension CameraEngine: AVCaptureFileOutputRecordingDelegate {
-    func fileOutput(_ output: AVCaptureFileOutput, didStartRecordingTo fileURL: URL, from connections: [AVCaptureConnection]) {
-        print("[MovieOutput] didStartRecordingTo \(fileURL.lastPathComponent)")
-        DispatchQueue.main.async { [weak self] in
-            self?.isRecording = true
-        }
-    }
-
-    func fileOutput(_ output: AVCaptureFileOutput, didFinishRecordingTo outputFileURL: URL, from connections: [AVCaptureConnection], error: Error?) {
-        print("[MovieOutput] didFinishRecordingTo \(outputFileURL.lastPathComponent) error=\(String(describing: error))")
-        DispatchQueue.main.async { [weak self] in
-            guard let self = self else { return }
-            self.isRecording = false
-            self.isRecordingInternal = false
-            if let error = error {
-                self.lastSavedMessage = "录像失败: \(error.localizedDescription)"
-            } else {
-                PhotoLibrarySaver.save(outputFileURL)
-                self.lastSavedMessage = "已保存到相册"
+            guard let pb = CMSampleBufferGetImageBuffer(sb) else { return }
+            let pts = CMSampleBufferGetPresentationTimeStamp(sb)
+            // 按实际帧尺寸初始化编码器
+            let w = CVPixelBufferGetWidth(pb)
+            let h = CVPixelBufferGetHeight(pb)
+            if w != encoderWidth || h != encoderHeight {
+                encoderWidth = w; encoderHeight = h
+                encoder.setup(width: w, height: h, fps: frameRate.rawValue,
+                              bitrate: computeBitrate(resolution: videoResolution, fps: frameRate.rawValue))
             }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self.lastSavedMessage = nil }
+            encoder.encode(pixelBuffer: pb, presentationTime: pts, forceKeyframe: isRecordingInternal)
+        } else if output === audioOutput {
+            // 音频帧深拷贝后存入缓冲，用于预录
+            if let aCopy = Self.deepCopyEncodedSample(sb) {
+                if preRecordOnInternal, var b = audioBuffer { b.write(aCopy) }
+                if isRecordingInternal { writer.appendAudio(aCopy) }
+            }
+            voiceManager.feedAudio(sb)
         }
     }
 }
