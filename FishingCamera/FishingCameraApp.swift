@@ -432,7 +432,7 @@ final class VoiceController {
         guard let outBuf = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: cap) else { return nil }
         var err: NSError?
         var fed = false
-        let ok = converter.convert(to: outBuf, error: &err) { _, outStatus in
+        let status = converter.convert(to: outBuf, error: &err) { _, outStatus in
             if fed {
                 outStatus.pointee = .noDataNow
                 return nil
@@ -441,7 +441,8 @@ final class VoiceController {
             outStatus.pointee = .haveData
             return inBuf
         }
-        return (ok && err == nil) ? outBuf : nil
+        let produced = (status == .haveData || status == .inputRanDry)
+        return (produced && err == nil) ? outBuf : nil
     }
 }
 
@@ -1179,7 +1180,9 @@ struct Settings: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
-                    Button("完成") { dismiss() }.fontWeight(.bold).foregroundStyle(T.accent)
+                    Button { dismiss() } label: {
+                        Text("完成").fontWeight(.bold).foregroundStyle(T.accent)
+                    }
                 }
             }
         }.preferredColorScheme(.dark)
