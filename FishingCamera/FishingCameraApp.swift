@@ -449,12 +449,13 @@ final class SoundFeedback {
 }
 
 // MARK: - 电量管理
-@MainActor
 final class BatteryManager {
     private var timer: Timer?
     func start(_ onChange: @escaping (Float) -> Void) {
-        UIDevice.current.isBatteryMonitoringEnabled = true
-        onChange(UIDevice.current.batteryLevel)
+        DispatchQueue.main.async {
+            UIDevice.current.isBatteryMonitoringEnabled = true
+            onChange(UIDevice.current.batteryLevel)
+        }
         timer?.invalidate()
         timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { _ in
             Task { @MainActor in onChange(UIDevice.current.batteryLevel) }
