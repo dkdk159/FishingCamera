@@ -336,6 +336,7 @@ final class MovieWriter {
     private var active = false
     private var videoAppended = 0
     private var outputURL: URL?
+    private var audioAppended = 0
     private var lastVideoPTS = CMTime.invalid
     private var lastAudioPTS = CMTime.invalid
 
@@ -359,7 +360,9 @@ final class MovieWriter {
                 let w = try AVAssetWriter(outputURL: url, fileType: .mp4)
 
                 let vIn = AVAssetWriterInput(mediaType: .video, outputSettings: nil, sourceFormatHint: vHint)
-                vIn.expectsMediaDataInRealTime = true
+                // 预录帧是"历史数据"而非实时数据，必须 realtime=false，
+                // 否则 AVAssetWriter 会按实时速度节流（135 帧要写 3 秒并丢帧）
+                vIn.expectsMediaDataInRealTime = false
                 if let t = transform { vIn.transform = t }
                 guard w.canAdd(vIn) else {
                     Log.write("[Writer] 无法添加视频轨")
@@ -372,7 +375,7 @@ final class MovieWriter {
                 let aSettings: [String: Any] = [AVFormatIDKey: kAudioFormatMPEG4AAC, AVEncoderBitRateKey: 128000]
                 let aIn = AVAssetWriterInput(mediaType: .audio, outputSettings: aSettings,
                                              sourceFormatHint: aValid.first.flatMap { CMSampleBufferGetFormatDescription($0) })
-                aIn.expectsMediaDataInRealTime = true
+                aIn.expectsMediaDataInRealTime = false
                 let hasAudio = w.canAdd(aIn)
                 if hasAudio { w.add(aIn) }
 
@@ -387,12 +390,13 @@ final class MovieWriter {
                 self.audioInput = hasAudio ? aIn : nil
                 self.outputURL = url
                 self.videoAppended = 0
+                self.audioAppended = 0
                 self.lastVideoPTS = startTime
                 self.lastAudioPTS = .invalid
                 self.active = true
 
                 self.writeBulk(video: video, audio: aValid)
-                Log.write("[Writer] 开始 预录v=\(video.count) a=\(aValid.count) 音频=\(hasAudio) 已写=\(self.videoAppended)")
+                Log.write("[Writer] 开始 预录v=\(video.count) a=\(aValid.count) 音频=\(hasAudio) 已写v=\(self.videoAppended) a=\(self.audioAppended)")
                 // 只要 writer 启动成功就算成功；能否出帧交由 finish 判断
                 DispatchQueue.main.async { completion(true) }
             } catch {
@@ -427,15 +431,15 @@ final class MovieWriter {
                     if vIn.append(video[vi]) { videoAppended += 1; lastVideoPTS = p }
                     vi += 1
                 } else {
-                    Thread.sleep(forTimeInterval: 0.005)
+                    Thread.sleep(forTimeInterval: 0.002)
                 }
             } else if let aIn = audioInput {
                 if aIn.isReadyForMoreMediaData {
                     let p = CMSampleBufferGetPresentationTimeStamp(audio[ai])
-                    if aIn.append(audio[ai]) { lastAudioPTS = p }
+                    if aIn.append(audio[ai]) { audioAppended += 1; lastAudioPTS = p }
                     ai += 1
                 } else {
-                    Thread.sleep(forTimeInterval: 0.005)
+                    Thread.sleep(forTimeInterval: 0.002)
                 }
             } else {
                 ai += 1
@@ -450,7 +454,11 @@ final class MovieWriter {
             let pts = CMSampleBufferGetPresentationTimeStamp(s)
             // PTS 必须单调递增，否则 AVAssetWriter 会写入失败甚至抛异常
             if self.lastVideoPTS.isValid && CMTimeCompare(pts, self.lastVideoPTS) <= 0 { return }
-            // 未就绪时不盲目 append（会阻塞/抛异常），本帧丢弃
+            // 短暂等待就绪（最多约 0.1 秒），尽量不丢帧；绝不盲目 append
+            var spins = 0
+            while !vIn.isReadyForMoreMediaData && spins < 20 && w.status == .writing {
+                Thread.sleep(forTimeInterval: 0.005); spins += 1
+            }
             guard vIn.isReadyForMoreMediaData else { return }
             self.lastVideoPTS = pts
             if vIn.append(s) { self.videoAppended += 1 }
@@ -462,6 +470,10 @@ final class MovieWriter {
                   let w = self.writer, w.status == .writing else { return }
             let pts = CMSampleBufferGetPresentationTimeStamp(s)
             if self.lastAudioPTS.isValid && CMTimeCompare(pts, self.lastAudioPTS) <= 0 { return }
+            var spins = 0
+            while !aIn.isReadyForMoreMediaData && spins < 20 && w.status == .writing {
+                Thread.sleep(forTimeInterval: 0.005); spins += 1
+            }
             guard aIn.isReadyForMoreMediaData else { return }
             self.lastAudioPTS = pts
             _ = aIn.append(s)
@@ -508,7 +520,7 @@ final class MovieWriter {
 
     private func cleanup() {
         writer = nil; videoInput = nil; audioInput = nil
-        outputURL = nil; videoAppended = 0; active = false
+        outputURL = nil; videoAppended = 0; audioAppended = 0; active = false
         lastVideoPTS = .invalid; lastAudioPTS = .invalid
     }
 }
@@ -771,19 +783,20 @@ final class CameraEngine: NSObject, ObservableObject {
         }
     }
 
-    /// 启动看门狗：3 秒内没真正进入写入状态就中止并复位，避免永久卡在"点了没反应"
+    /// 启动看门狗：8 秒内没真正进入写入状态就中止并复位，避免永久卡在"点了没反应"
+    /// （预录帧批量写入需要时间，超时不能太短，否则会误杀正常的写入器）
     private func armStartWatchdog() {
         disarmStartWatchdog()
-        startWatchdog = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: false) { [weak self] _ in
+        startWatchdog = Timer.scheduledTimer(withTimeInterval: 8.0, repeats: false) { [weak self] _ in
             guard let self = self else { return }
             self.stateLock.lock()
-            let stuck = self._starting || (self._recording && !self._live)
+            let neverLive = self._starting || !self._live
             self.stateLock.unlock()
-            guard stuck else { return }
-            Log.write("[Record] 启动超时(3秒)：未进入写入状态，已复位")
+            guard neverLive else { return }
+            Log.write("[Record] 启动超时(8秒)：未进入写入状态，已复位")
             self.writer.cancel()
             self.resetRecordingState()
-            self.showStatus("录像启动失败：无画面")
+            self.showStatus("录像启动超时，请看日志")
         }
     }
     private func disarmStartWatchdog() { startWatchdog?.invalidate(); startWatchdog = nil }
@@ -1051,6 +1064,8 @@ final class CameraEngine: NSObject, ObservableObject {
             let v = self.preRecordFlag ? self.trimToFirstKeyframe(vAll) : self.trimToLastKeyframe(vAll)
             let startPTS = v.first.map { CMSampleBufferGetPresentationTimeStamp($0) } ?? .zero
             let a = aAll.filter { CMTimeCompare(CMSampleBufferGetPresentationTimeStamp($0), startPTS) >= 0 }
+
+            Log.write("[Record] 缓冲v=\(vAll.count) 关键帧\(vAll.filter { $0.isKeyFrame }.count) 窗口v=\(v.count) a=\(a.count)")
 
             if v.isEmpty {
                 // 还没有可用帧（刚启动）：等第一帧关键帧到来后再建 writer
