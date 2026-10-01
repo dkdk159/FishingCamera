@@ -1,4 +1,4 @@
-import SwiftUI
+﻿import SwiftUI
 import AVFoundation
 import Photos
 import UIKit
@@ -524,8 +524,8 @@ final class CameraEngine: NSObject, ObservableObject {
     private let aOut = AVCaptureAudioDataOutput()
     private var device: AVCaptureDevice?
     private var enc = VideoCompressor()
-    private var vRing = SampleRingBuffer(maxSeconds: 30, maxBytes: Self.videoBudget)
-    private var aRing = SampleRingBuffer(maxSeconds: 30, maxBytes: Self.audioBudget)
+    private var vRing = SampleRingBuffer(maxSeconds: 30, maxBytes: 200 * 1024 * 1024)
+    private var aRing = SampleRingBuffer(maxSeconds: 30, maxBytes: 8 * 1024 * 1024)
     private let rec = Recorder()
 
     /// 预录缓冲内存预算，防止 4K/高帧率长预录被系统杀死
@@ -776,8 +776,8 @@ final class CameraEngine: NSObject, ObservableObject {
                 if self.recording { self.rec.appendVideo(kept) }
             }
         }
-        vRing = SampleRingBuffer(maxSeconds: max(preSec, 1), maxBytes: Self.videoBudget)
-        aRing = SampleRingBuffer(maxSeconds: max(preSec, 1), maxBytes: Self.audioBudget)
+        vRing = SampleRingBuffer(maxSeconds: max(preSec, 1), maxBytes: CameraEngine.videoBudget)
+        aRing = SampleRingBuffer(maxSeconds: max(preSec, 1), maxBytes: CameraEngine.audioBudget)
     }
 
     // MARK: 切换镜头
@@ -830,8 +830,8 @@ final class CameraEngine: NSObject, ObservableObject {
         preRecord = p; Beep.shared.tap(); preSec = p.seconds
         sq.async { [weak self] in
             guard let self = self else { return }
-            self.vRing = SampleRingBuffer(maxSeconds: max(p.seconds, 1), maxBytes: Self.videoBudget)
-            self.aRing = SampleRingBuffer(maxSeconds: max(p.seconds, 1), maxBytes: Self.audioBudget)
+            self.vRing = SampleRingBuffer(maxSeconds: max(p.seconds, 1), maxBytes: CameraEngine.videoBudget)
+            self.aRing = SampleRingBuffer(maxSeconds: max(p.seconds, 1), maxBytes: CameraEngine.audioBudget)
         }
     }
 
