@@ -1126,6 +1126,7 @@ extension CameraEngine: AVCaptureVideoDataOutputSampleBufferDelegate,
 extension CameraEngine: AVCaptureFileOutputRecordingDelegate {
     func fileOutput(_ output: AVCaptureFileOutput,
                     didFinishRecordingTo outputFileURL: URL,
+                    from connections: [AVCaptureConnection],
                     error: Error?) {
         let nsErr = error as NSError?
         let finishedOK = (nsErr == nil)
