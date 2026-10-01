@@ -249,20 +249,77 @@ enum PreviewMode: String, CaseIterable {
 }
 
 // MARK: - 音频反馈
+// 参照参考相机 App 的提示音：约 856Hz 的短促三连“滴”，响亮清晰，用于让用户明确听到“开始/关闭录制”。
+// 使用进程内合成的 WAV + AVAudioPlayer 播放，走 app 扬声器输出，
+// 避免 AudioServicesPlaySystemSound 在录音(playAndRecord)会话下被压低/听不到的问题。
 final class AudioFeedback {
-    // 大疆式提示音：1057 = 短促“滴”声，配合振动，录影启动/停止听感清晰
-    private let beep: SystemSoundID = 1057
+    /// 一次性合成的提示音 WAV（PCM 16bit/单声道/44.1kHz，856Hz 三连脉冲）
+    private lazy var beepData: Data = {
+        let sr = 44100
+        let freq = 856.0
+        let amp = 28000.0
+        // 三下“滴”：短-短-长，参考大疆相机提示声
+        let pulses: [(offset: Double, dur: Double)] = [(0.015, 0.09), (0.145, 0.09), (0.275, 0.20)]
+        let totalFrames = Int(0.6 * Double(sr))
+        var pcm = [Int16](repeating: 0, count: totalFrames)
+        for (off, dur) in pulses {
+            let start = Int(off * Double(sr))
+            let cnt = Int(dur * Double(sr))
+            for i in 0..<cnt {
+                let idx = start + i
+                if idx >= totalFrames { break }
+                let t = Double(i) / Double(sr)
+                let env = exp(-t * 22.0) // 指数衰减，听感短促
+                pcm[idx] = Int16(sin(2 * Double.pi * freq * t) * amp * env)
+            }
+        }
+        // 组装 WAV header + PCM
+        var data = Data()
+        data.append(contentsOf: Array("RIFF".utf8))
+        var sz: UInt32 = UInt32(36 + totalFrames * 2)
+        data.append(contentsOf: Data(bytes: &sz, count: 4))
+        data.append(contentsOf: Array("WAVEfmt ".utf8))
+        var sub1: UInt32 = 16; data.append(contentsOf: Data(bytes: &sub1, count: 4))
+        var audioFmt: UInt16 = 1; data.append(contentsOf: Data(bytes: &audioFmt, count: 2))
+        var ch: UInt16 = 1; data.append(contentsOf: Data(bytes: &ch, count: 2))
+        var srate: UInt32 = UInt32(sr); data.append(contentsOf: Data(bytes: &srate, count: 4))
+        var byteRate: UInt32 = UInt32(sr * 2); data.append(contentsOf: Data(bytes: &byteRate, count: 4))
+        var blockAlign: UInt16 = 2; data.append(contentsOf: Data(bytes: &blockAlign, count: 2))
+        var bits: UInt16 = 16; data.append(contentsOf: Data(bytes: &bits, count: 2))
+        data.append(contentsOf: Array("data".utf8))
+        var dataSz: UInt32 = UInt32(totalFrames * 2); data.append(contentsOf: Data(bytes: &dataSz, count: 4))
+        pcm.withUnsafeBytes { data.append(contentsOf: $0) }
+        return data
+    }()
+
+    private var player: AVAudioPlayer?
+    /// 播放收敛到单一串行队列，避免 beepData懒初始化/AVAudioPlayer 在并发线程下的竞争
+    private let audioQueue = DispatchQueue(label: "com.fishingcamera.beep")
+
+    private func playBeep() {
+        audioQueue.async { [weak self] in
+            guard let self = self else { return }
+            guard let p = try? AVAudioPlayer(data: self.beepData) else { return }
+            p.volume = 1.0
+            p.prepareToPlay()
+            p.play()
+            self.player = p
+            DispatchQueue.global().asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                if self?.player === p { self?.player = nil }
+            }
+        }
+    }
 
     func sayStart() {
-        AudioServicesPlaySystemSound(beep)
+        playBeep()
         AudioServicesPlaySystemSound(kSystemSoundID_Vibrate)
     }
     func sayStop() {
-        AudioServicesPlaySystemSound(beep)
+        playBeep()
         AudioServicesPlaySystemSound(kSystemSoundID_Vibrate)
     }
     func sayInterrupted() {
-        AudioServicesPlaySystemSound(beep)
+        playBeep()
     }
 }
 
@@ -870,7 +927,7 @@ final class PreRecordWriter {
                 }
                 // 直写 H.264 压缩帧（passthrough），不做二次编码
                 let vIn = AVAssetWriterInput(mediaType: .video, outputSettings: nil, sourceFormatHint: vfd)
-                vIn.expectsMediaDataInRealTime = false
+                vIn.expectsMediaDataInRealTime = true
                 if mirrorVertical {
                     var t = CGAffineTransform.identity
                     t = t.translatedBy(x: 0, y: 1); t = t.scaledBy(x: 1, y: -1)
@@ -896,7 +953,7 @@ final class PreRecordWriter {
                         AVFormatIDKey: kAudioFormatMPEG4AAC, AVEncoderBitRateKey: 128000
                     ])
                 }
-                aIn?.expectsMediaDataInRealTime = false
+                aIn?.expectsMediaDataInRealTime = true
                 if let aIn = aIn, w.canAdd(aIn) { w.add(aIn) }
 
                 guard w.startWriting() else {
@@ -916,7 +973,10 @@ final class PreRecordWriter {
                     CMTimeCompare(CMSampleBufferGetPresentationTimeStamp($0), start) >= 0
                 }
                 var vi = 0, ai = 0
-                while vi < v.count || ai < a.count {
+                // realtime 模式下 isReadyForMoreMediaData 可能瞬时为 false（writer 内部暂满），
+                // 这时不能推进索引，否则预录帧会被静默丢弃；改为短暂等待重试，并设总超时保护防死等。
+                let writeDeadline = CFAbsoluteTimeGetCurrent() + 5.0
+                while (vi < v.count || ai < a.count) && CFAbsoluteTimeGetCurrent() < writeDeadline {
                     let takeV: Bool
                     if ai >= a.count { takeV = true }
                     else if vi >= v.count { takeV = false }
@@ -924,12 +984,20 @@ final class PreRecordWriter {
                         takeV = CMTimeCompare(CMSampleBufferGetPresentationTimeStamp(v[vi]),
                                                CMSampleBufferGetPresentationTimeStamp(a[ai])) <= 0
                     }
+                    let ready: Bool
                     if takeV {
-                        if vIn.isReadyForMoreMediaData, vIn.append(v[vi]) { self.appendedVideo += 1 }
-                        vi += 1
+                        ready = vIn.isReadyForMoreMediaData
+                        if ready, vIn.append(v[vi]) { self.appendedVideo += 1 }
                     } else {
-                        if let aIn = aIn, aIn.isReadyForMoreMediaData { _ = aIn.append(a[ai]) }
-                        ai += 1
+                        if let aIn = aIn {
+                            ready = aIn.isReadyForMoreMediaData
+                            if ready { _ = aIn.append(a[ai]) }
+                        } else { ready = true }
+                    }
+                    if ready {
+                        if takeV { vi += 1 } else { ai += 1 }
+                    } else {
+                        Thread.sleep(forTimeInterval: 0.01)
                     }
                 }
                 self.writer = w; self.vInput = vIn; self.aInput = aIn; self.active = true
