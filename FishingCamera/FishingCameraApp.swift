@@ -767,7 +767,7 @@ final class CameraEngine: NSObject, ObservableObject {
         guard cs == noErr, let nb = newBuf else { free(mem); return copied }
 
         // 用新的 block buffer 替换 sample buffer 里的 data buffer
-        CMSampleBufferSetDataBuffer(copied, nb)
+        CMSampleBufferSetDataBuffer(copied, newValue: nb)
         return copied
     }
 
