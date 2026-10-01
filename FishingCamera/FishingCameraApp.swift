@@ -272,25 +272,32 @@ final class H264VideoEncoder {
     func setup(width: Int, height: Int, fps: Int, bitrate: Int) {
         lock.lock(); defer { lock.unlock() }
         if let old = session {
-            VTCompressionSessionCompleteFrames(old, untilPresentationTimeStamp: .invalid)
-            VTCompressionSessionInvalidate(old); session = nil
+            session = nil
+            VTCompressionSessionInvalidate(old)
         }
         var spec: CFDictionary? = nil
         if #available(iOS 17.4, *) {
             spec = [kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder as String: true] as CFDictionary
         }
+        // 明确指定 NV12 输入格式，匹配相机输出
+        let attrs: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        ]
         var ns: VTCompressionSession?
         let st = VTCompressionSessionCreate(
             allocator: kCFAllocatorDefault, width: Int32(width), height: Int32(height),
             codecType: kCMVideoCodecType_H264, encoderSpecification: spec,
-            imageBufferAttributes: nil, compressedDataAllocator: nil,
+            imageBufferAttributes: attrs as CFDictionary, compressedDataAllocator: nil,
             outputCallback: { refcon, _, status, _, sb in
                 guard status == noErr, let s = sb, let r = refcon else { return }
                 Unmanaged<H264VideoEncoder>.fromOpaque(r).takeUnretainedValue().onEncodedSample?(s)
             },
             refcon: Unmanaged.passUnretained(self).toOpaque(),
             compressionSessionOut: &ns)
-        guard st == noErr, let s = ns else { return }
+        guard st == noErr, let s = ns else {
+            print("[Encoder] create fail status=\(st) w=\(width) h=\(height)")
+            return
+        }
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AverageBitRate, value: bitrate as CFNumber)
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_High_AutoLevel)
@@ -298,6 +305,7 @@ final class H264VideoEncoder {
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
         VTCompressionSessionPrepareToEncodeFrames(s)
         session = s
+        print("[Encoder] setup ok w=\(width) h=\(height)")
     }
 
     func encode(pixelBuffer: CVPixelBuffer, presentationTime: CMTime, forceKeyframe: Bool) {
@@ -469,7 +477,7 @@ final class CameraEngine: NSObject, ObservableObject {
 
             self.applyAllConnectionSettings()
             self.captureSession.commitConfiguration()
-            self.setupEncoder()
+            // setupEncoder 移到 captureOutput 里按实际帧尺寸初始化，避免二次 setup 崩溃
             self.rebuildBuffers()
             self.applyFrameRate()
             self.captureSession.startRunning()
@@ -573,7 +581,7 @@ final class CameraEngine: NSObject, ObservableObject {
             self.currentVideoDevice = d
             self.applyAllConnectionSettings()
             self.captureSession.commitConfiguration()
-            self.setupEncoder()
+            self.encoderWidth = 0; self.encoderHeight = 0 // 强制 captureOutput 重建编码器
             DispatchQueue.main.async { self.currentLens = lens }
         }
     }
@@ -590,7 +598,7 @@ final class CameraEngine: NSObject, ObservableObject {
                 self.captureSession.sessionPreset = r.sessionPreset
             }
             self.captureSession.commitConfiguration()
-            self.setupEncoder()
+            self.encoderWidth = 0; self.encoderHeight = 0
             self.rebuildBuffers()
             self.applyFrameRate()
         }
@@ -601,7 +609,8 @@ final class CameraEngine: NSObject, ObservableObject {
         DispatchQueue.main.async { self.frameRate = f }
         sessionQueue.async { [weak self] in
             guard let self = self else { return }
-            self.setupEncoder(); self.applyFrameRate(); self.rebuildBuffers()
+            self.encoderWidth = 0; self.encoderHeight = 0
+            self.applyFrameRate(); self.rebuildBuffers()
         }
     }
 
