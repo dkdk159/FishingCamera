@@ -513,6 +513,7 @@ final class CameraEngine: NSObject, ObservableObject {
     @Published var delayOn = false
     @Published var battery: Float = 1
     @Published var denied = false
+    @Published var micGranted = true
     @Published var toast: String?
     @Published var countdown: Int?
     @Published var actualFormat = ""
@@ -535,7 +536,6 @@ final class CameraEngine: NSObject, ObservableObject {
     private var started = false
     private var recording = false
     private var preSec: TimeInterval = 30
-    private var micGranted = true
     private var delayTimer: Timer?
     private var batteryTimer: Timer?
     private var heardDismissWork: DispatchWorkItem?
@@ -571,7 +571,7 @@ final class CameraEngine: NSObject, ObservableObject {
             guard let self = self else { return }
             guard g else { DispatchQueue.main.async { self.denied = true }; return }
             AVCaptureDevice.requestAccess(for: .audio) { mic in
-                self.micGranted = mic
+                DispatchQueue.main.async { self.micGranted = mic }
                 self.configAudio()
                 self.sq.async { self.buildSession() }
             }
