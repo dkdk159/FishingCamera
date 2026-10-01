@@ -488,33 +488,36 @@ final class CameraEngine: NSObject, ObservableObject {
             self.isRecordingInternal = true
             DispatchQueue.main.async {
                 self.isRecording = true
-                if let id = self.shutterSound.soundID {
-                    AudioServicesPlaySystemSound(id)
-                }
+                if self.shutterSound != .none { BeepPlayer.shared.playStart() }
+                else { AudioServicesPlaySystemSound(kSystemSoundID_Vibrate) }
             }
         }
     }
 
     private func trimToKeyframe(_ samples: [CMSampleBuffer]) -> [CMSampleBuffer] {
         for (i, sample) in samples.enumerated() {
-            guard let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false) as? [[CFString: Any]] else { continue }
-            let isNotSync = attachments.first?[kCMSampleAttachmentKey_NotSync] as? Bool ?? false
-            if !isNotSync {
-                return Array(samples[i...])
-            }
+            if isKeyFrame(sample) { return Array(samples[i...]) }
         }
-        return samples
+        return []
     }
 
     func stopRecording() {
         sessionQueue.async { [weak self] in
             guard let self = self, self.isRecordingInternal else { return }
-            self.writer.end()
             self.isRecordingInternal = false
             DispatchQueue.main.async {
                 self.isRecording = false
-                AudioServicesPlaySystemSound(1105)
-                self.lastSavedMessage = "已保存到相册"
+                if self.shutterSound != .none { BeepPlayer.shared.playStop() }
+                else { AudioServicesPlaySystemSound(kSystemSoundID_Vibrate) }
+            }
+            self.writer.end { [weak self] url in
+                guard let self = self else { return }
+                if let url = url {
+                    PhotoLibrarySaver.save(url)
+                    self.lastSavedMessage = "✓ 已保存到相册"
+                } else {
+                    self.lastSavedMessage = "保存失败"
+                }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self.lastSavedMessage = nil }
                 if self.isAutoPreRecordEnabled {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
@@ -548,69 +551,191 @@ extension CameraEngine: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureA
     }
 }
 
-// MARK: - 预录写入器
+// MARK: - 预录写入器（所有方法只在 writerQueue 调用）
 final class PreRecordWriter {
     private var writer: AVAssetWriter?
     private var vInput: AVAssetWriterInput?
     private var aInput: AVAssetWriterInput?
     private var active = false
     private var url: URL?
+    private let queue = DispatchQueue(label: "com.fishingcamera.writer")
 
     func begin(videoSamples: [CMSampleBuffer], audioSamples: [CMSampleBuffer], outputURL: URL) {
-        guard !active else { return }
-        url = outputURL
-        do {
-            writer = try AVAssetWriter(outputURL: outputURL, fileType: .mp4)
+        queue.async { [weak self] in
+            guard let self = self, !self.active else { return }
+            self.url = outputURL
+            do {
+                if FileManager.default.fileExists(atPath: outputURL.path) {
+                    try? FileManager.default.removeItem(at: outputURL)
+                }
+                let w = try AVAssetWriter(outputURL: outputURL, fileType: .mp4)
 
-            vInput = AVAssetWriterInput(mediaType: .video, outputSettings: nil)
-            vInput?.expectsMediaDataInRealTime = false
+                // passthrough 必须提供 sourceFormatHint，从首个已编码帧取格式描述
+                var vHint: CMFormatDescription? = nil
+                for s in videoSamples {
+                    if let fd = CMSampleBufferGetFormatDescription(s) { vHint = fd; break }
+                }
+                guard let vfd = vHint else {
+                    print("[Writer] 无视频格式描述，放弃写入"); return
+                }
+                let vIn = AVAssetWriterInput(mediaType: .video, outputSettings: nil, sourceFormatHint: vfd)
+                vIn.expectsMediaDataInRealTime = false
+                vIn.transform = CGAffineTransform(rotationAngle: .pi / 2) // 竖屏
+                guard w.canAdd(vIn) else { print("[Writer] 无法添加视频轨道"); return }
+                w.add(vIn)
 
-            let aSettings: [String: Any] = [
-                AVFormatIDKey: kAudioFormatMPEG4AAC,
-                AVNumberOfChannelsKey: 1, AVSampleRateKey: 44100,
-                AVEncoderBitRateKey: 128000
-            ]
-            aInput = AVAssetWriterInput(mediaType: .audio, outputSettings: aSettings)
-            aInput?.expectsMediaDataInRealTime = true
+                // 音频：只指定 AAC，采样率/声道跟随麦克风源，避免声明不一致
+                let aIn = AVAssetWriterInput(mediaType: .audio, outputSettings: [
+                    AVFormatIDKey: kAudioFormatMPEG4AAC,
+                    AVEncoderBitRateKey: 128_000
+                ])
+                aIn.expectsMediaDataInRealTime = false
+                if w.canAdd(aIn) { w.add(aIn) }
 
-            if let v = vInput, writer!.canAdd(v) { writer!.add(v) }
-            if let a = aInput, writer!.canAdd(a) { writer!.add(a) }
+                guard w.startWriting() else {
+                    print("[Writer] startWriting 失败: \(w.error?.localizedDescription ?? "?")"); return
+                }
 
-            writer?.startWriting()
+                // 从首个关键帧开始
+                var v = videoSamples
+                if let ki = v.firstIndex(where: { isKeyFrame($0) }) {
+                    v = Array(v[ki...])
+                } else { v = [] }
 
-            if let firstVideo = videoSamples.first {
-                writer?.startSession(atSourceTime: CMSampleBufferGetPresentationTimeStamp(firstVideo))
-            } else if let firstAudio = audioSamples.first {
-                writer?.startSession(atSourceTime: CMSampleBufferGetPresentationTimeStamp(firstAudio))
-            } else {
-                writer?.startSession(atSourceTime: .zero)
+                let start: CMTime
+                if let f = v.first {
+                    start = CMSampleBufferGetPresentationTimeStamp(f)
+                } else if let f = audioSamples.first {
+                    start = CMSampleBufferGetPresentationTimeStamp(f)
+                } else {
+                    start = .zero
+                }
+                w.startSession(atSourceTime: start)
+
+                // 严格按 PTS 交替写入历史帧
+                let a = audioSamples.filter {
+                    CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp($0)) >= CMTimeGetSeconds(start) - 0.02
+                }
+                var vi = 0, ai = 0
+                while vi < v.count || ai < a.count {
+                    let takeV: Bool
+                    if ai >= a.count { takeV = true }
+                    else if vi >= v.count { takeV = false }
+                    else {
+                        let vt = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(v[vi]))
+                        let at = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(a[ai]))
+                        takeV = vt <= at
+                    }
+                    if takeV {
+                        if vIn.isReadyForMoreMediaData { vIn.append(v[vi]) }
+                        vi += 1
+                    } else {
+                        if aIn.isReadyForMoreMediaData { aIn.append(a[ai]) }
+                        ai += 1
+                    }
+                }
+
+                self.writer = w
+                self.vInput = vIn
+                self.aInput = aIn
+                self.active = true
+                print("[Writer] begin v=\(v.count) a=\(a.count)")
+            } catch {
+                print("[Writer] begin error: \(error)")
             }
-            active = true
-
-            let maxCount = max(videoSamples.count, audioSamples.count)
-            for i in 0..<maxCount {
-                if i < videoSamples.count { appendVideo(videoSamples[i]) }
-                if i < audioSamples.count { appendAudio(audioSamples[i]) }
-            }
-        } catch { print("[Writer] \(error)") }
+        }
     }
 
     func appendVideo(_ s: CMSampleBuffer) {
-        guard active, let input = vInput, input.isReadyForMoreMediaData else { return }
-        input.append(s)
-    }
-    func appendAudio(_ s: CMSampleBuffer) {
-        guard active, let input = aInput, input.isReadyForMoreMediaData else { return }
-        input.append(s)
+        queue.async { [weak self] in
+            guard let self = self, self.active,
+                  let input = self.vInput,
+                  let w = self.writer, w.status == .writing else { return }
+            if input.isReadyForMoreMediaData { input.append(s) }
+        }
     }
 
-    func end() {
-        guard active, let u = url else { return }
-        vInput?.markAsFinished(); aInput?.markAsFinished()
-        let ref = writer
-        writer = nil; vInput = nil; aInput = nil; active = false; url = nil
-        ref?.finishWriting { PhotoLibrarySaver.save(u) }
+    func appendAudio(_ s: CMSampleBuffer) {
+        queue.async { [weak self] in
+            guard let self = self, self.active,
+                  let input = self.aInput,
+                  let w = self.writer, w.status == .writing else { return }
+            if input.isReadyForMoreMediaData { input.append(s) }
+        }
     }
+
+    func end(completion: @escaping (URL?) -> Void) {
+        queue.async { [weak self] in
+            guard let self = self, self.active, let u = self.url, let w = self.writer else {
+                DispatchQueue.main.async { completion(nil) }
+                return
+            }
+            self.active = false
+            self.vInput?.markAsFinished()
+            self.aInput?.markAsFinished()
+            let v = self.vInput, a = self.aInput
+            self.vInput = nil; self.aInput = nil; self.writer = nil; self.url = nil
+            w.finishWriting {
+                let ok = w.status == .completed
+                let url = ok ? u : nil
+                if let e = w.error { print("[Writer] finish error: \(e)") }
+                DispatchQueue.main.async { completion(url) }
+            }
+        }
+    }
+}
+
+private func isKeyFrame(_ sb: CMSampleBuffer) -> Bool {
+    guard let arr = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: false)
+        as? [[CFString: Any]], let a = arr.first else { return true }
+    return !(a[kCMSampleAttachmentKey_NotSync] as? Bool ?? false)
+}
+
+// MARK: - 提示音（不受静音开关影响，钓鱼时也能听到）
+final class BeepPlayer {
+    static let shared = BeepPlayer()
+    private let engine = AVAudioEngine()
+    private let player = AVAudioPlayerNode()
+
+    private init() {
+        engine.attach(player)
+        engine.connect(player, to: engine.mainMixerNode, format: nil)
+        try? engine.start()
+    }
+
+    /// 生成指定频率的短促 beep 音频缓冲
+    private func makeBuffer(freq: Float, duration: TimeInterval) -> AVAudioPCMBuffer {
+        let sampleRate: Float = 44100
+        let frameCount = AVAudioFrameCount(duration * Double(sampleRate))
+        let fmt = AVAudioFormat(standardFormatWithSampleRate: Double(sampleRate), channels: 1)!
+        let buf = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: frameCount)!
+        buf.frameLength = frameCount
+        let ch = buf.floatChannelData![0]
+        let gain: Float = 0.6
+        let fade = Int(Double(sampleRate) * 0.01) // 10ms 淡入淡出避免爆音
+        for i in 0..<Int(frameCount) {
+            let t = Float(i) / sampleRate
+            var s = sin(2 * .pi * freq * t) * gain
+            if i < fade { s *= Float(i) / Float(fade) }
+            else if i > Int(frameCount) - fade { s *= Float(Int(frameCount) - i) / Float(fade) }
+            ch[i] = s
+        }
+        return buf
+    }
+
+    private func play(freq: Float, duration: TimeInterval) {
+        let buf = makeBuffer(freq: freq, duration: duration)
+        player.stop()
+        player.scheduleBuffer(buf, at: nil, options: .interrupts)
+        if !engine.isRunning { try? engine.start() }
+        player.play()
+        // 同时震动，双重反馈
+        AudioServicesPlaySystemSound(kSystemSoundID_Vibrate)
+    }
+
+    func playStart() { play(freq: 880, duration: 0.15) }   // 高音叮
+    func playStop()  { play(freq: 523, duration: 0.20) }   // 低音叮
+    func playError() { play(freq: 220, duration: 0.30) }  // 错误提示
 }
 
 enum PhotoLibrarySaver {
