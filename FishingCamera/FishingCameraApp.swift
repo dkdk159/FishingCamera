@@ -368,9 +368,13 @@ final class CameraEngine: NSObject, ObservableObject {
         }
         encoder.onEncodedSample = { [weak self] sb in
             guard let self = self else { return }
+            // 必须复制，VideoToolbox 回调返回后 sb 会被系统释放
+            var copy: CMSampleBuffer?
+            CMSampleBufferCreateCopy(allocator: kCFAllocatorDefault, sampleBuffer: sb, sampleBufferOut: &copy)
+            guard let copied = copy else { return }
             self.sessionQueue.async {
-                if self.preRecordOnInternal { self.compressedVideoBuffer?.write(sb) }
-                if self.isRecordingInternal { self.writer.appendVideo(sb) }
+                if self.preRecordOnInternal { self.compressedVideoBuffer?.write(copied) }
+                if self.isRecordingInternal { self.writer.appendVideo(copied) }
             }
         }
         MPRemoteCommandCenter.shared().togglePlayPauseCommand.addTarget { [weak self] _ in
@@ -718,8 +722,13 @@ extension CameraEngine: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureA
             }
             encoder.encode(pixelBuffer: pb, presentationTime: pts, forceKeyframe: isRecordingInternal)
         } else if output === audioOutput {
-            if preRecordOnInternal, var b = audioBuffer { b.write(sb) }
-            if isRecordingInternal { writer.appendAudio(sb) }
+            // 音频帧也要复制，回调返回后会被释放
+            var aCopy: CMSampleBuffer?
+            CMSampleBufferCreateCopy(allocator: kCFAllocatorDefault, sampleBuffer: sb, sampleBufferOut: &aCopy)
+            if let aCopy = aCopy {
+                if preRecordOnInternal, var b = audioBuffer { b.write(aCopy) }
+                if isRecordingInternal { writer.appendAudio(aCopy) }
+            }
             voiceManager.feedAudio(sb)
         }
     }
