@@ -1,5 +1,6 @@
 ﻿import SwiftUI
 import AVFoundation
+import VideoToolbox
 import Photos
 import Speech
 import AudioToolbox
