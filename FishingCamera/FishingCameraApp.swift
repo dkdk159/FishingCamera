@@ -1150,6 +1150,9 @@ struct CameraScreen: View {
 
 struct IconButton: View {
     let icon: String; let on: Bool; let action: () -> Void
+    init(_ icon: String, on: Bool, action: @escaping () -> Void) {
+        self.icon = icon; self.on = on; self.action = action
+    }
     var body: some View {
         Button(action: action) {
             Image(systemName: icon).font(.system(size: 15))
@@ -1258,6 +1261,9 @@ struct Cell: View {
 
 struct ToggleRow: View {
     let title: String; @Binding var on: Bool
+    init(_ title: String, _ on: Binding<Bool>) {
+        self.title = title; self._on = on
+    }
     var body: some View {
         HStack {
             Text(title).font(.system(size: 15)).foregroundColor(.white)
